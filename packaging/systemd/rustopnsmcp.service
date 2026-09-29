@@ -5,37 +5,37 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=opnsmcp
-Group=opnsmcp
+User=rustopnsmcp
+Group=rustopnsmcp
 ExecStart=/usr/local/bin/rustopnsmcp \
-    --device-mapping /etc/opnsmcp/devices.json \
-    --tokens-file /var/lib/opnsmcp/tokens.json \
+    --device-mapping /etc/rustopnsmcp/devices.json \
+    --tokens-file /var/lib/rustopnsmcp/tokens.json \
     --transport streamable-http \
     --host @OPNSMCP_BIND_HOST@ --port 30037 \
     --allowed-host @OPNSMCP_ALLOWED_HOST@ \
     --allowed-origin @OPNSMCP_ALLOWED_ORIGIN@ \
-    --tls-cert /etc/opnsmcp/tls/fullchain.pem \
-    --tls-key /etc/opnsmcp/tls/privkey.pem \
+    --tls-cert /etc/rustopnsmcp/tls/fullchain.pem \
+    --tls-key /etc/rustopnsmcp/tls/privkey.pem \
     --audit-format json \
-    --audit-log-file /var/lib/opnsmcp/audit.jsonl \
+    --audit-log-file /var/lib/rustopnsmcp/audit.jsonl \
     --audit-journald
 Restart=on-failure
 RestartSec=5
 UMask=0077
-EnvironmentFile=-/etc/opnsmcp/secrets.env
+EnvironmentFile=-/etc/rustopnsmcp/secrets.env
 
-# /etc/opnsmcp stays read-only to the service. This is deliberate: it is what
-# makes editing the device inventory a root operation rather than something
-# the server could be talked into — phase 1 has no write tools at all, and
-# this keeps it that way at the filesystem layer too.
+# /etc/rustopnsmcp stays read-only to the service. This is deliberate: it is
+# what makes editing the device inventory a root operation rather than
+# something the server could be talked into — phase 1 has no write tools at
+# all, and this keeps it that way at the filesystem layer too.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 NoNewPrivileges=yes
-StateDirectory=opnsmcp
+StateDirectory=rustopnsmcp
 StateDirectoryMode=0700
-ReadWritePaths=/var/lib/opnsmcp
+ReadWritePaths=/var/lib/rustopnsmcp
 
 # Seccomp filter and syscall restrictions.
 # SystemCallErrorNumber=EPERM makes a denied syscall return an error instead
