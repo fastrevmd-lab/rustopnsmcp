@@ -13,15 +13,15 @@
 ---
 
 `rustopnsmcp` is the OPNsense member of the mechub MCP server family. It does
-for OPNsense what [`rustjunosmcp`](https://github.com/fastrevmd-lab/rustjunosmcp)
-does for Junos, [`rustpanosmcp`](https://github.com/fastrevmd-lab/rustpanosmcp)
-for PAN-OS and [`rustunifimcp`](https://github.com/fastrevmd-lab/rustunifimcp)
+for OPNsense what [`rustjunosmcp`](https://github.com/mechubsec/rustjunosmcp)
+does for Junos, [`rustpanosmcp`](https://github.com/mechubsec/rustpanosmcp)
+for PAN-OS and [`rustunifimcp`](https://github.com/mechubsec/rustunifimcp)
 for UniFi: a curated, scoped, audited MCP surface over one vendor's management
 API.
 
 It is built **mecmcp-native**: authentication, transport, audit, policy,
 inventory, redaction and change control all come from
-[`mecmcp`](https://github.com/fastrevmd-lab/mecmcp), the shared Rust foundation.
+[`mecmcp`](https://github.com/mechubsec/mecmcp), the shared Rust foundation.
 What lives here is the OPNsense resource model, the tool surface and the
 workflows.
 
@@ -41,7 +41,7 @@ workflows.
 - **Phase 2b — governed writes, firewall rules:** the same lifecycle,
   extended to firewall filter rules. Not yet started.
 
-Design and scope: [mecmcp#425](https://github.com/fastrevmd-lab/mecmcp/issues/425).
+Design and scope: [mecmcp#425](https://github.com/mechubsec/mecmcp/issues/425).
 
 ## License
 
