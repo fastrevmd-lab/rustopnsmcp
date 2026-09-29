@@ -167,6 +167,21 @@ where
     let mut succeeded = Vec::new();
     let mut attempted_and_failed = Vec::new();
     let mut never_attempted = Vec::new();
+    // Indeterminate updates/deletes whose reconciliation came back
+    // `NotApplied` or errored outright. Restoring the pre-image for an
+    // update or delete is idempotent either way — a `setItem` back to the
+    // pre-image value is a no-op if the update never landed, and a re-create
+    // of a deleted alias is exactly what the pre-image already documents —
+    // so these are rolled back unconditionally rather than trusted to a
+    // reconciliation check that can itself be wrong (see
+    // `client::flatten_for_write`'s field-order sensitivity) or fail.
+    let mut needs_rollback: Vec<StagedMutation> = Vec::new();
+    // A create whose reconciliation errored: unlike an update/delete, there
+    // is no uuid to roll back without knowing whether the device assigned
+    // one, so this cannot be folded into `needs_rollback`. It must not be
+    // reported as a plain `partial` either, since that would imply the
+    // ordinary "roll back what is known" story applies to it.
+    let mut indeterminate_creates: Vec<StagedMutation> = Vec::new();
     let mut created_uuids: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
 
@@ -190,14 +205,34 @@ where
                             created_uuids.insert(index, uuid);
                         }
                     }
-                    Ok(Reconciled::NotApplied) | Err(_) => {
-                        // Either it confirmed the write did not land, or the
-                        // reconciliation check itself failed. Both are the
-                        // fail-closed choice: stop and roll back what is
-                        // known to have succeeded rather than assume this one
-                        // is safe to leave alone.
+                    Ok(Reconciled::NotApplied) => {
                         attempted_and_failed.push(mutation.clone());
                         never_attempted.extend(mutations[index + 1..].iter().cloned());
+                        // A create confirmed not to have landed has nothing
+                        // to roll back. An update/delete is rolled back
+                        // anyway: restoring the pre-image is idempotent, and
+                        // this confirmation itself can be wrong (see
+                        // `client::flatten_for_write`'s field-order
+                        // sensitivity).
+                        if !matches!(mutation, StagedMutation::Create { .. }) {
+                            needs_rollback.push(mutation.clone());
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        attempted_and_failed.push(mutation.clone());
+                        never_attempted.extend(mutations[index + 1..].iter().cloned());
+                        // The reconciliation check itself failed: whether
+                        // this landed is unknown, not merely "probably not".
+                        // A create cannot be rolled back without a uuid, so
+                        // it must be surfaced distinctly rather than folded
+                        // into a plain partial. An update/delete is rolled
+                        // back anyway, since that is safe either way.
+                        if matches!(mutation, StagedMutation::Create { .. }) {
+                            indeterminate_creates.push(mutation.clone());
+                        } else {
+                            needs_rollback.push(mutation.clone());
+                        }
                         break;
                     }
                 }
@@ -211,31 +246,42 @@ where
     }
 
     if !attempted_and_failed.is_empty() || !never_attempted.is_empty() {
+        // `needs_rollback` holds at most the one mutation apply just broke
+        // on, appended after every confirmed success, so this concatenation
+        // is still the prefix of `mutations` that `created_uuids`' indices
+        // assume.
+        let mut to_roll_back = succeeded.clone();
+        to_roll_back.extend(needs_rollback.iter().cloned());
+
         let rollback_result =
-            rollback_to_preimage(controller, preimage, &succeeded, &created_uuids).await;
+            rollback_to_preimage(controller, preimage, &to_roll_back, &created_uuids).await;
 
         let mut failed = attempted_and_failed.clone();
         failed.extend(never_attempted.clone());
 
-        return match rollback_result {
-            Ok(()) => Outcome {
-                state: State::Partial,
-                succeeded,
-                failed,
-                attempted_and_failed,
-                never_attempted,
-                rollback_failures: Vec::new(),
-                verification_failure: None,
-            },
-            Err(rollback_failures) => Outcome {
-                state: State::PartialRollbackFailed,
-                succeeded,
-                failed,
-                attempted_and_failed,
-                never_attempted,
-                rollback_failures,
-                verification_failure: None,
-            },
+        let mut rollback_failures = rollback_result.err().unwrap_or_default();
+        rollback_failures.extend(indeterminate_creates.iter().map(|mutation| {
+            format!(
+                "{}: reconciliation after a timeout failed, so it is unknown whether this \
+                 create landed; without a uuid there is nothing to roll back",
+                mutation.preview()
+            )
+        }));
+
+        let state = if rollback_failures.is_empty() {
+            State::Partial
+        } else {
+            State::PartialRollbackFailed
+        };
+
+        return Outcome {
+            state,
+            succeeded,
+            failed,
+            attempted_and_failed,
+            never_attempted,
+            rollback_failures,
+            verification_failure: None,
         };
     }
 
@@ -324,11 +370,24 @@ where
             }
             StagedMutation::Update { uuid, body } => match controller.fetch_alias(uuid).await {
                 Ok(Some(fetched)) => {
-                    if let Some(expected_name) = body.get("name")
-                        && fetched.get("name") != Some(expected_name)
-                    {
-                        failed_verifications
-                            .push(format!("update {uuid}: field mismatch after apply"));
+                    // `fetched` is `getItem` shape; flatten it before
+                    // comparing against the staged (flat) body, or every
+                    // option/list field would mismatch regardless of whether
+                    // it actually landed.
+                    let flattened = super::validate::flatten_for_write(&fetched);
+                    let mut mismatched: Vec<&str> = Vec::new();
+                    if let Some(fields) = body.as_object() {
+                        for (key, value) in fields {
+                            if flattened.get(key) != Some(value) {
+                                mismatched.push(key.as_str());
+                            }
+                        }
+                    }
+                    if !mismatched.is_empty() {
+                        failed_verifications.push(format!(
+                            "update {uuid}: field mismatch after apply ({})",
+                            mismatched.join(", ")
+                        ));
                     }
                 }
                 Ok(None) => {
@@ -386,7 +445,7 @@ mod tests {
     /// than silently returning a default.
     struct MockController {
         apply_results: Mutex<VecDeque<Result<Option<String>, OpnsenseError>>>,
-        reconcile_results: Mutex<VecDeque<Reconciled>>,
+        reconcile_results: Mutex<VecDeque<Result<Reconciled, OpnsenseError>>>,
         fetch_alias_results: Mutex<VecDeque<Result<Option<serde_json::Value>, OpnsenseError>>>,
         reconfigure_result: Mutex<Option<Result<(), OpnsenseError>>>,
         rollback_fails: bool,
@@ -463,12 +522,11 @@ mod tests {
             &self,
             _mutation: &StagedMutation,
         ) -> Result<Reconciled, OpnsenseError> {
-            Ok(self
-                .reconcile_results
+            self.reconcile_results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("reconcile_indeterminate called more times than scripted"))
+                .expect("reconcile_indeterminate called more times than scripted")
         }
     }
 
@@ -549,7 +607,7 @@ mod tests {
             .reconcile_results
             .lock()
             .unwrap()
-            .push_back(Reconciled::Applied(Some("uuid-a".to_owned())));
+            .push_back(Ok(Reconciled::Applied(Some("uuid-a".to_owned()))));
         // verify_applied fetches both created aliases afterwards.
         controller.fetch_alias_results.lock().unwrap().extend([
             Ok(Some(serde_json::json!({"name": "a"}))),
@@ -581,7 +639,7 @@ mod tests {
             .reconcile_results
             .lock()
             .unwrap()
-            .push_back(Reconciled::NotApplied);
+            .push_back(Ok(Reconciled::NotApplied));
 
         let preimage = Preimage::from_resources(Vec::new());
         let mutations = two_creates();
@@ -596,5 +654,178 @@ mod tests {
             controller.rollback_log.lock().unwrap()[0],
             mutations[0].preview()
         );
+    }
+
+    /// An indeterminate update that reconciliation confirms did *not* land
+    /// must still be rolled back: restoring the pre-image with `setItem` is
+    /// a no-op if the update genuinely never landed, and the confirmation
+    /// itself can be wrong (a staged `content` in different order or with a
+    /// different separator reads as `NotApplied` even when it landed). Before
+    /// this fix, only mutations that came before the failing one were rolled
+    /// back, so a wrongly reconciled update stayed live.
+    #[tokio::test]
+    async fn an_indeterminate_update_reads_as_not_applied_is_rolled_back_anyway() {
+        let controller = MockController::new();
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .push_back(Err(timeout_error()));
+        controller
+            .reconcile_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(Reconciled::NotApplied));
+
+        let preimage = Preimage::from_resources(vec![serde_json::json!({
+            "uuid": "u1",
+            "name": "before",
+        })]);
+        let mutations = vec![StagedMutation::update(
+            "u1",
+            serde_json::json!({"name": "after"}),
+        )];
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::Partial);
+        assert_eq!(controller.rollback_log.lock().unwrap().len(), 1);
+        assert_eq!(
+            controller.rollback_log.lock().unwrap()[0],
+            mutations[0].preview()
+        );
+    }
+
+    /// The same, but reconciliation itself errors rather than confirming
+    /// either way — the fail-closed choice is still to roll the update back.
+    #[tokio::test]
+    async fn an_indeterminate_delete_whose_reconciliation_errors_is_rolled_back_anyway() {
+        let controller = MockController::new();
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .push_back(Err(timeout_error()));
+        controller
+            .reconcile_results
+            .lock()
+            .unwrap()
+            .push_back(Err(timeout_error()));
+
+        let preimage = Preimage::from_resources(vec![serde_json::json!({
+            "uuid": "u1",
+            "name": "gone",
+        })]);
+        let mutations = vec![StagedMutation::delete("u1")];
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::Partial);
+        assert_eq!(controller.rollback_log.lock().unwrap().len(), 1);
+        assert_eq!(
+            controller.rollback_log.lock().unwrap()[0],
+            mutations[0].preview()
+        );
+    }
+
+    /// A create whose reconciliation itself errors is unknown, not
+    /// "probably didn't land" — and there is no uuid to roll back even if it
+    /// did. Before this fix this was reported as a plain `Partial`,
+    /// indistinguishable from a definite, fully-accounted-for failure.
+    #[tokio::test]
+    async fn a_create_whose_reconciliation_errors_is_not_reported_as_plain_partial() {
+        let controller = MockController::new();
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .push_back(Err(timeout_error()));
+        controller
+            .reconcile_results
+            .lock()
+            .unwrap()
+            .push_back(Err(timeout_error()));
+
+        let preimage = Preimage::from_resources(Vec::new());
+        let mutations = vec![StagedMutation::create(
+            serde_json::json!({"name": "a", "type": "host"}),
+        )];
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::PartialRollbackFailed);
+        assert_eq!(outcome.rollback_failures.len(), 1);
+        assert!(
+            outcome.rollback_failures[0].contains("create alias 'a'"),
+            "{:?}",
+            outcome.rollback_failures
+        );
+        // No uuid was ever known, so nothing was attempted against the
+        // device for this mutation's rollback.
+        assert!(controller.rollback_log.lock().unwrap().is_empty());
+    }
+
+    /// `verify_applied` must compare every staged field, not only `name` —
+    /// otherwise a write that landed with the right name but a stale
+    /// `content` is reported as fully `Applied`.
+    #[tokio::test]
+    async fn verify_applied_catches_a_mismatch_outside_the_name_field() {
+        let controller = MockController::new();
+        controller.apply_results.lock().unwrap().push_back(Ok(None));
+        controller
+            .fetch_alias_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(
+                serde_json::json!({"name": "web_servers", "content": "10.0.0.9"}),
+            )));
+
+        let preimage = Preimage::from_resources(vec![serde_json::json!({
+            "uuid": "u1",
+            "name": "web_servers",
+            "content": "10.0.0.1",
+        })]);
+        let mutations = vec![StagedMutation::update(
+            "u1",
+            serde_json::json!({"name": "web_servers", "content": "10.0.0.1"}),
+        )];
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::AppliedUnverified);
+        let failure = outcome.verification_failure.expect("must report a failure");
+        assert!(failure.contains("content"), "{failure}");
+    }
+
+    /// A staged `content` given unsorted or comma-separated, once
+    /// `canonicalize_mutations` runs on it at staging time (as
+    /// `opnsense_stage_change` does), must verify as `Applied` — not
+    /// `AppliedUnverified` — against a device that echoes it back sorted and
+    /// newline-joined. Before canonicalization existed, this staged value
+    /// would have read as a `content` mismatch purely from formatting, even
+    /// though it landed correctly.
+    #[tokio::test]
+    async fn a_canonicalized_unsorted_content_update_verifies_as_applied() {
+        let controller = MockController::new();
+        controller.apply_results.lock().unwrap().push_back(Ok(None));
+        controller
+            .fetch_alias_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(
+                serde_json::json!({"name": "web_servers", "content": "10.0.0.1\n10.0.0.2"}),
+            )));
+
+        let preimage = Preimage::from_resources(vec![serde_json::json!({
+            "uuid": "u1",
+            "name": "web_servers",
+            "content": "10.0.0.9",
+        })]);
+        let mut mutations = vec![StagedMutation::update(
+            "u1",
+            serde_json::json!({"name": "web_servers", "content": "10.0.0.2,10.0.0.1"}),
+        )];
+        super::super::validate::canonicalize_mutations(&mut mutations);
+
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::Applied);
+        assert!(outcome.verification_failure.is_none());
     }
 }
