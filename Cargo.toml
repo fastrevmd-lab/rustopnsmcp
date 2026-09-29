@@ -30,6 +30,7 @@ tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url         = "2"
+uuid        = { version = "1", features = ["v4"] }
 zeroize     = "1"
 
 # Test-only
@@ -37,9 +38,13 @@ rcgen        = "0.14"
 tempfile     = "3"
 tokio-rustls = "0.26"
 
-# mecmcp is consumed read-only at an exact pinned version. Do not relax the tag.
+# mecmcp is consumed at an exact pinned version. Do not relax the tag.
+# mecmcp-changeset is the governed-write lifecycle (plan -> digest -> human
+# approve -> apply with drift check); every other crate here is read-only
+# support (transport, auth, audit, secrets, inventory).
 mecmcp-audit     = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
 mecmcp-auth      = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
+mecmcp-changeset = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
 mecmcp-http      = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
 mecmcp-inventory = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }
 mecmcp-runtime   = { version = "0.24.1", git = "https://github.com/fastrevmd-lab/mecmcp", tag = "v0.24.1" }

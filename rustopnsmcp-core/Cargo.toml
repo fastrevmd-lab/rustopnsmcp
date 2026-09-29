@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+mecmcp-changeset.workspace = true
 mecmcp-http.workspace      = true
 mecmcp-inventory.workspace = true
 mecmcp-redact.workspace    = true

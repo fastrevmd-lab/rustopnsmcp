@@ -12,6 +12,7 @@ authors.workspace = true
 rustopnsmcp-core.workspace = true
 mecmcp-audit.workspace = true
 mecmcp-auth.workspace = true
+mecmcp-changeset.workspace = true
 mecmcp-redact.workspace = true
 mecmcp-runtime.workspace = true
 mecmcp-server.workspace = true
@@ -27,6 +28,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rustls.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

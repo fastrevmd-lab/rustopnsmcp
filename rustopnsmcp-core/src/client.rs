@@ -11,6 +11,7 @@
 //! insecure-skip-verify knob, which `mecmcp-http` does not offer at any
 //! layer.
 
+use crate::endpoints;
 use crate::error::OpnsenseError;
 use crate::inventory::Device;
 use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
@@ -140,6 +141,386 @@ impl OpnsenseClient {
         let detail = mecmcp_redact::redact_text(&sanitized);
         OpnsenseError::Upstream { status, detail }
     }
+
+    /// Fetch one firewall alias by UUID.
+    ///
+    /// OPNsense's `getItem` wraps the item's fields under a top-level
+    /// `"alias"` key and does not echo the UUID back into the body, so this
+    /// unwraps that envelope and inserts `uuid` itself, which is what
+    /// [`crate::changeset::Preimage`] keys entries by.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpnsenseError::WriteRefused`] for a malformed UUID,
+    /// [`OpnsenseError::Upstream`] with `status: 404` if the alias does not
+    /// exist, and [`OpnsenseError::Malformed`] if the response has no
+    /// `"alias"` object.
+    pub async fn get_alias_item(&self, uuid: &str) -> Result<serde_json::Value, OpnsenseError> {
+        validate_uuid(uuid)?;
+        let raw = self.get(&endpoints::aliases_get_item(uuid)).await?;
+        interpret_get_item_response(raw, uuid)
+    }
+
+    /// Search for an alias by exact name.
+    ///
+    /// Used to reconcile a `create` whose response was lost to a transport
+    /// failure: the device may have persisted it even though this process
+    /// never saw a confirming response, and this is the only way to check
+    /// without a UUID to fetch by.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::post`].
+    async fn find_alias_uuid_by_name(&self, name: &str) -> Result<Option<String>, OpnsenseError> {
+        let body = serde_json::json!({
+            "current": 1,
+            "rowCount": 50,
+            "searchPhrase": name,
+        });
+        let raw = self.post(endpoints::ALIASES_SEARCH, &body).await?;
+        let Some(rows) = raw.get("rows").and_then(serde_json::Value::as_array) else {
+            return Ok(None);
+        };
+        Ok(rows
+            .iter()
+            .find(|row| row.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .and_then(|row| row.get("uuid").and_then(serde_json::Value::as_str))
+            .map(str::to_owned))
+    }
+
+    /// Create a firewall alias.
+    ///
+    /// Persists to `config.xml` immediately; the write is not live until
+    /// [`Self::reconfigure_aliases`] runs. `body` is wrapped under `"alias"`
+    /// per OPNsense's write convention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpnsenseError::WriteRefused`] if the device reports
+    /// `result != "saved"` (a validation failure, reported with HTTP 200), or
+    /// if the response has no `uuid`.
+    pub async fn add_alias(&self, body: &serde_json::Value) -> Result<String, OpnsenseError> {
+        let payload = serde_json::json!({ "alias": body });
+        let raw = self.post(endpoints::ALIASES_ADD_ITEM, &payload).await?;
+        Self::require_saved(&raw)?;
+        raw.get("uuid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| OpnsenseError::Malformed("addItem response has no uuid".to_owned()))
+    }
+
+    /// Update a firewall alias by UUID.
+    ///
+    /// Same immediate-persist-but-not-loaded semantics as [`Self::add_alias`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add_alias`], plus [`OpnsenseError::WriteRefused`] for a
+    /// malformed UUID.
+    pub async fn set_alias(
+        &self,
+        uuid: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), OpnsenseError> {
+        validate_uuid(uuid)?;
+        let payload = serde_json::json!({ "alias": body });
+        let raw = self
+            .post(&endpoints::aliases_set_item(uuid), &payload)
+            .await?;
+        Self::require_saved(&raw)
+    }
+
+    /// Delete a firewall alias by UUID.
+    ///
+    /// Idempotent: OPNsense reports `result: "not found"` for a UUID that no
+    /// longer exists, which is treated as success so a retried delete is
+    /// safe to repeat.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpnsenseError::WriteRefused`] for a malformed UUID or a
+    /// device response naming neither `"deleted"` nor `"not found"`.
+    pub async fn delete_alias(&self, uuid: &str) -> Result<(), OpnsenseError> {
+        validate_uuid(uuid)?;
+        let raw = self
+            .post(&endpoints::aliases_del_item(uuid), &serde_json::json!({}))
+            .await?;
+        match raw.get("result").and_then(serde_json::Value::as_str) {
+            Some("deleted" | "not found") => Ok(()),
+            _ => Err(OpnsenseError::WriteRefused(format!(
+                "device did not confirm the delete: {}",
+                crate::error::sanitize_detail(&raw.to_string())
+            ))),
+        }
+    }
+
+    /// Load staged alias writes into the live `pf` alias tables.
+    ///
+    /// This is the closest thing to a commit OPNsense's alias API has:
+    /// nothing written by [`Self::add_alias`], [`Self::set_alias`], or
+    /// [`Self::delete_alias`] takes effect until this runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpnsenseError::WriteRefused`] if the device does not report
+    /// success.
+    pub async fn reconfigure_aliases(&self) -> Result<(), OpnsenseError> {
+        let raw = self
+            .post(endpoints::ALIASES_RECONFIGURE, &serde_json::json!({}))
+            .await?;
+        interpret_reconfigure_response(&raw)
+    }
+
+    /// Require an `addItem`/`setItem` response to report `result: "saved"`.
+    ///
+    /// OPNsense reports a validation failure as HTTP 200 with
+    /// `{"result": "failed", "validations": {...}}`, not as a non-2xx
+    /// status, so [`Self::post`] alone cannot detect it.
+    fn require_saved(raw: &serde_json::Value) -> Result<(), OpnsenseError> {
+        if raw.get("result").and_then(serde_json::Value::as_str) == Some("saved") {
+            return Ok(());
+        }
+        let detail = raw.get("validations").unwrap_or(raw).to_string();
+        Err(OpnsenseError::WriteRefused(format!(
+            "device rejected the write: {}",
+            crate::error::sanitize_detail(&detail)
+        )))
+    }
+}
+
+/// Interpret a raw `getItem` response into the pre-image shape.
+///
+/// OPNsense's `getItem` wraps the item's fields under a top-level `"alias"`
+/// key and does not echo the UUID back into the body, so this unwraps that
+/// envelope and inserts `uuid` itself, which is what
+/// [`crate::changeset::Preimage`] keys entries by.
+///
+/// OPNsense answers an unknown UUID with HTTP 200 and a bare `[]`, not a 404
+/// status — a device response this crate's HTTP layer never turns into an
+/// error — so that shape must be translated into the same "not found" signal
+/// callers of [`crate::changeset::ControllerOps::fetch_alias`] already expect
+/// from a real 404. Without this, every delete would be misread as having
+/// left the alias in place.
+///
+/// A URL-table alias's body can carry `username`/`password` for an
+/// authenticated fetch. Those fields are dropped here, at the one place every
+/// pre-image is built, rather than trusted to `WRITABLE_FIELDS` or the
+/// caller: the pre-image is echoed back in previews and persisted in the
+/// change-set store, and neither is a place for a credential to end up.
+///
+/// # Errors
+///
+/// Returns [`OpnsenseError::Upstream`] with `status: 404` for an empty-array
+/// response, and [`OpnsenseError::Malformed`] if the response has no
+/// `"alias"` object.
+fn interpret_get_item_response(
+    raw: serde_json::Value,
+    uuid: &str,
+) -> Result<serde_json::Value, OpnsenseError> {
+    if matches!(&raw, serde_json::Value::Array(items) if items.is_empty()) {
+        return Err(OpnsenseError::Upstream {
+            status: 404,
+            detail: "alias not found".to_owned(),
+        });
+    }
+
+    let Some(alias) = raw.get("alias").filter(|value| value.is_object()) else {
+        return Err(OpnsenseError::Malformed(
+            "getItem response has no alias object".to_owned(),
+        ));
+    };
+
+    let mut body = alias.clone();
+    let object = body
+        .as_object_mut()
+        .expect("checked is_object via filter above");
+    object.remove("username");
+    object.remove("password");
+    object.insert(
+        "uuid".to_owned(),
+        serde_json::Value::String(uuid.to_owned()),
+    );
+    Ok(body)
+}
+
+/// Interpret a raw `reconfigure` response.
+///
+/// A missing `status` field is not evidence of success — only an explicit
+/// `"ok"` is. Treating an ambiguous or absent field as success is exactly the
+/// "probably fine" default this server must not take: a genuine failure with
+/// a differently-shaped body would otherwise be recorded as `Applied`.
+///
+/// # Errors
+///
+/// Returns [`OpnsenseError::WriteRefused`] for anything but `status: "ok"`.
+fn interpret_reconfigure_response(raw: &serde_json::Value) -> Result<(), OpnsenseError> {
+    match raw.get("status").and_then(serde_json::Value::as_str) {
+        Some("ok") => Ok(()),
+        _ => Err(OpnsenseError::WriteRefused(format!(
+            "reconfigure did not report success: {}",
+            crate::error::sanitize_detail(&raw.to_string())
+        ))),
+    }
+}
+
+/// Validate an alias UUID before it is interpolated into a URL path.
+///
+/// OPNsense alias UUIDs are canonical 36-character UUIDs
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hex digits and hyphens only).
+/// Restricting to that exact shape means a malformed value can never smuggle
+/// an extra path segment, a `..`, or a query string into a request built by
+/// `format!`.
+///
+/// # Errors
+///
+/// Returns [`OpnsenseError::WriteRefused`] if `uuid` is not that shape.
+pub fn validate_uuid(uuid: &str) -> Result<(), OpnsenseError> {
+    let is_canonical = uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(i, byte)| match i {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+
+    if is_canonical {
+        Ok(())
+    } else {
+        Err(OpnsenseError::WriteRefused(format!(
+            "'{uuid}' is not a canonical UUID"
+        )))
+    }
+}
+
+impl crate::changeset::ControllerOps for OpnsenseClient {
+    async fn apply_mutation(
+        &self,
+        mutation: &crate::changeset::StagedMutation,
+    ) -> Result<Option<String>, OpnsenseError> {
+        use crate::changeset::StagedMutation;
+
+        match mutation {
+            StagedMutation::Create { body } => self.add_alias(body).await.map(Some),
+            StagedMutation::Update { uuid, body } => {
+                self.set_alias(uuid, body).await?;
+                Ok(None)
+            }
+            StagedMutation::Delete { uuid } => {
+                self.delete_alias(uuid).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn rollback_mutation(
+        &self,
+        mutation: &crate::changeset::StagedMutation,
+        prior_value: Option<&serde_json::Value>,
+        created_uuid: Option<&str>,
+    ) -> Result<(), OpnsenseError> {
+        use crate::changeset::{StagedMutation, flatten_for_write};
+
+        match mutation {
+            StagedMutation::Create { .. } => {
+                let uuid = created_uuid.ok_or_else(|| {
+                    OpnsenseError::Malformed("rollback create: no created uuid provided".to_owned())
+                })?;
+                self.delete_alias(uuid).await
+            }
+            StagedMutation::Update { uuid, .. } => {
+                let prior = prior_value.ok_or_else(|| {
+                    OpnsenseError::Malformed(format!("rollback update {uuid}: no prior value"))
+                })?;
+                // `prior` is `getItem` shape (option fields as `{value,
+                // selected}` maps); `setItem` requires the flat shape.
+                // Replaying it verbatim either gets refused as malformed or
+                // silently drops a field.
+                self.set_alias(uuid, &flatten_for_write(prior)).await
+            }
+            StagedMutation::Delete { uuid } => {
+                let prior = prior_value.ok_or_else(|| {
+                    OpnsenseError::Malformed(format!("rollback delete {uuid}: no prior value"))
+                })?;
+                // Flattened for the same reason as the update arm above.
+                // `uuid` is not in `WRITABLE_FIELDS`, so flattening also
+                // drops the bookkeeping key `get_alias_item` inserted; the
+                // device assigns a fresh one on re-create.
+                self.add_alias(&flatten_for_write(prior)).await.map(|_| ())
+            }
+        }
+    }
+
+    async fn preimage_matches(
+        &self,
+        preimage: &crate::changeset::Preimage,
+        mutations: &[crate::changeset::StagedMutation],
+    ) -> Result<bool, OpnsenseError> {
+        for mutation in mutations {
+            let Some(uuid) = mutation.resource_uuid() else {
+                continue;
+            };
+
+            let Some(recorded) = preimage.get(uuid) else {
+                return Ok(false);
+            };
+
+            let current = self.fetch_alias(uuid).await?;
+            match current {
+                Some(live) if live == recorded => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    async fn fetch_alias(&self, uuid: &str) -> Result<Option<serde_json::Value>, OpnsenseError> {
+        match self.get_alias_item(uuid).await {
+            Ok(body) => Ok(Some(body)),
+            Err(OpnsenseError::Upstream { status: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn reconfigure(&self) -> Result<(), OpnsenseError> {
+        self.reconfigure_aliases().await
+    }
+
+    async fn reconcile_indeterminate(
+        &self,
+        mutation: &crate::changeset::StagedMutation,
+    ) -> Result<crate::changeset::Reconciled, OpnsenseError> {
+        use crate::changeset::{Reconciled, StagedMutation, flatten_for_write};
+
+        match mutation {
+            StagedMutation::Create { body } => {
+                let Some(name) = body.get("name").and_then(serde_json::Value::as_str) else {
+                    return Ok(Reconciled::NotApplied);
+                };
+                Ok(match self.find_alias_uuid_by_name(name).await? {
+                    Some(uuid) => Reconciled::Applied(Some(uuid)),
+                    None => Reconciled::NotApplied,
+                })
+            }
+            StagedMutation::Update { uuid, body } => {
+                let Some(current) = self.fetch_alias(uuid).await? else {
+                    return Ok(Reconciled::NotApplied);
+                };
+                let flattened = flatten_for_write(&current);
+                let landed = body.as_object().is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .all(|(key, value)| flattened.get(key) == Some(value))
+                });
+                Ok(if landed {
+                    Reconciled::Applied(None)
+                } else {
+                    Reconciled::NotApplied
+                })
+            }
+            StagedMutation::Delete { uuid } => Ok(match self.fetch_alias(uuid).await? {
+                None => Reconciled::Applied(None),
+                Some(_) => Reconciled::NotApplied,
+            }),
+        }
+    }
 }
 
 /// Build the `Authorization: Basic ...` header value from the API key and
@@ -192,5 +573,113 @@ mod tests {
         )
         .expect("parses");
         assert!(OpnsenseClient::new(device).is_err());
+    }
+
+    /// A canonical UUID is accepted; anything that could smuggle an extra
+    /// path segment, `..`, or a query string into a `format!`-built URL must
+    /// be refused before it ever reaches one.
+    #[test]
+    fn validate_uuid_accepts_canonical_and_refuses_everything_else() {
+        assert!(super::validate_uuid("dddddddd-dddd-4ddd-8ddd-dddddddddddd").is_ok());
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd/../etc",
+            "dddddddd-dddd-4ddd-8ddd-ddddddddddd",
+            "dddddddd/dddd/4ddd/8ddd/dddddddddddd",
+            "dddddddd-dddd-4ddd-8ddd-ddddddddddd?x=1",
+        ] {
+            assert!(super::validate_uuid(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// OPNsense reports a validation failure as HTTP 200 with
+    /// `result: "failed"`, not as a non-2xx status. `require_saved` is the
+    /// only thing standing between that and a write this server reports as
+    /// successful.
+    #[test]
+    fn require_saved_rejects_a_200_with_result_failed() {
+        let raw =
+            serde_json::json!({"result": "failed", "validations": {"alias.name": "required"}});
+        let error = OpnsenseClient::require_saved(&raw).expect_err("failed must be rejected");
+        assert!(error.to_string().contains("name"), "{error}");
+    }
+
+    #[test]
+    fn require_saved_accepts_result_saved() {
+        let raw = serde_json::json!({"result": "saved", "uuid": "x"});
+        assert!(OpnsenseClient::require_saved(&raw).is_ok());
+    }
+
+    /// OPNsense answers an unknown UUID with HTTP 200 and a bare `[]`, not a
+    /// 404 — without this translation, `fetch_alias`'s `Ok(None)` arm (which
+    /// only fires on a real 404) can never be reached, and every successful
+    /// delete would be misread as having left the alias in place.
+    #[test]
+    fn get_item_interprets_an_empty_array_as_not_found() {
+        let raw = serde_json::json!([]);
+        let error = super::interpret_get_item_response(raw, "u1").expect_err("must be refused");
+        assert!(
+            matches!(
+                error,
+                crate::error::OpnsenseError::Upstream { status: 404, .. }
+            ),
+            "{error}"
+        );
+    }
+
+    /// A response with no `"alias"` object — the fallback the old code took
+    /// instead of refusing — must be rejected rather than silently accepted
+    /// as the alias body.
+    #[test]
+    fn get_item_rejects_a_response_with_no_alias_object() {
+        let raw = serde_json::json!({"unrelated": true});
+        assert!(super::interpret_get_item_response(raw, "u1").is_err());
+    }
+
+    /// A well-formed response is unwrapped from its `"alias"` envelope and
+    /// gets the UUID inserted, since `getItem` never echoes it back.
+    #[test]
+    fn get_item_unwraps_the_alias_envelope_and_inserts_the_uuid() {
+        let raw = serde_json::json!({"alias": {"name": "web_servers"}});
+        let body = super::interpret_get_item_response(raw, "u1").expect("parses");
+        assert_eq!(body.get("name"), Some(&serde_json::json!("web_servers")));
+        assert_eq!(body.get("uuid"), Some(&serde_json::json!("u1")));
+    }
+
+    /// A URL-table alias's `username`/`password` must never survive into the
+    /// pre-image: it is echoed back in previews and persisted in the
+    /// change-set store, and neither is a place for a credential to end up.
+    #[test]
+    fn get_item_strips_username_and_password_from_the_body() {
+        let raw = serde_json::json!({
+            "alias": {
+                "name": "blocklist",
+                "type": "urltable",
+                "content": "https://example.org/list.txt",
+                "username": "svc-account",
+                "password": "hunter2",
+            }
+        });
+        let body = super::interpret_get_item_response(raw, "u1").expect("parses");
+        assert!(body.get("username").is_none());
+        assert!(body.get("password").is_none());
+        assert_eq!(body.get("name"), Some(&serde_json::json!("blocklist")));
+    }
+
+    /// A missing `status` field must not be read as success — only an
+    /// explicit `"ok"` is accepted, so a genuine failure with a
+    /// differently-shaped body cannot be misrecorded as applied.
+    #[test]
+    fn reconfigure_requires_an_explicit_ok_status() {
+        assert!(
+            super::interpret_reconfigure_response(&serde_json::json!({"status": "ok"})).is_ok()
+        );
+        assert!(super::interpret_reconfigure_response(&serde_json::json!({})).is_err());
+        assert!(
+            super::interpret_reconfigure_response(&serde_json::json!({"status": "failed"}))
+                .is_err()
+        );
     }
 }

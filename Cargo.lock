@@ -1391,6 +1391,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mecmcp-changeset"
+version = "0.24.1"
+source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.24.1#f19b3b4c2730b3813304562039132a3d4bb9a6ee"
+dependencies = [
+ "async-trait",
+ "getrandom 0.4.3",
+ "hex",
+ "mecmcp-audit",
+ "mecmcp-secret",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "mecmcp-http"
 version = "0.24.1"
 source = "git+https://github.com/fastrevmd-lab/mecmcp?tag=v0.24.1#f19b3b4c2730b3813304562039132a3d4bb9a6ee"
@@ -2126,6 +2147,7 @@ dependencies = [
  "clap",
  "mecmcp-audit",
  "mecmcp-auth",
+ "mecmcp-changeset",
  "mecmcp-redact",
  "mecmcp-runtime",
  "mecmcp-server",
@@ -2142,6 +2164,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2149,6 +2172,7 @@ name = "rustopnsmcp-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "mecmcp-changeset",
  "mecmcp-http",
  "mecmcp-inventory",
  "mecmcp-redact",
@@ -2307,6 +2331,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

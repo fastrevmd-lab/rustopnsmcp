@@ -1,9 +1,10 @@
 //! The MCP tool surface.
 //!
-//! Phase 1 is read-only: nine tools, one per resource this phase covers.
-//! Governed writes (aliases, then firewall rules, through mecmcp's
-//! change-set lifecycle) are phase 2.
+//! Phase 1 covered nine read tools, one per resource. Phase 2a adds seven
+//! change-set lifecycle tools that govern writes to firewall aliases;
+//! firewall rules follow in a later phase.
 
+pub mod changeset;
 pub mod read;
 
 /// Every tool this server registers.
@@ -20,14 +21,28 @@ pub const TOOL_NAMES: &[&str] = &[
     "opnsense_list_routes",
     "opnsense_list_gateways",
     "opnsense_list_dhcp_leases",
+    "opnsense_create_change_set",
+    "opnsense_stage_change",
+    "opnsense_diff_change_set",
+    "opnsense_validate_change_set",
+    "opnsense_approve_change_set",
+    "opnsense_apply_change_set",
+    "opnsense_get_change_set",
 ];
 
 /// The mutating tools, passed to `mecmcp_server::authorize_call`.
 ///
-/// Empty in phase 1: every registered tool is a read. Left as a named,
-/// asserted-empty constant rather than omitted, so `WRITE_TOOLS.is_empty()`
-/// is a decision this phase made on purpose — visible in `tests/read_tools.rs`
-/// — rather than a fact nobody checked. Phase 2 populates it as change-set
-/// tools land, at which point it must never go back to empty by accident: see
-/// `mecmcp-server`'s `an_empty_write_tool_registry_lets_a_wildcard_reach_a_write_tool`.
-pub const WRITE_TOOLS: &[&str] = &[];
+/// All seven change-set tools: none of them is a wildcard for "read" scope,
+/// including the read-shaped `opnsense_diff_change_set`,
+/// `opnsense_validate_change_set`, and `opnsense_get_change_set` — they
+/// expose a plan's contents and preview, which a read-only caller has no
+/// business seeing before an owner or approver does.
+pub const WRITE_TOOLS: &[&str] = &[
+    "opnsense_create_change_set",
+    "opnsense_stage_change",
+    "opnsense_diff_change_set",
+    "opnsense_validate_change_set",
+    "opnsense_approve_change_set",
+    "opnsense_apply_change_set",
+    "opnsense_get_change_set",
+];

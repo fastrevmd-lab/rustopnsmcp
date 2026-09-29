@@ -10,6 +10,7 @@ Group=rustopnsmcp
 ExecStart=/usr/local/bin/rustopnsmcp \
     --device-mapping /etc/rustopnsmcp/devices.json \
     --tokens-file /var/lib/rustopnsmcp/tokens.json \
+    --state-file /var/lib/rustopnsmcp/changesets.json \
     --transport streamable-http \
     --host @OPNSMCP_BIND_HOST@ --port 30037 \
     --allowed-host @OPNSMCP_ALLOWED_HOST@ \
@@ -26,8 +27,8 @@ EnvironmentFile=-/etc/rustopnsmcp/secrets.env
 
 # /etc/rustopnsmcp stays read-only to the service. This is deliberate: it is
 # what makes editing the device inventory a root operation rather than
-# something the server could be talked into — phase 1 has no write tools at
-# all, and this keeps it that way at the filesystem layer too.
+# something the server could be talked into. Change-set state lives under
+# /var/lib/rustopnsmcp instead, which ReadWritePaths below allows.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

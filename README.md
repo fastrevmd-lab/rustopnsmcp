@@ -33,8 +33,13 @@ workflows.
   NAT, routes, DHCP leases, gateways, firmware/version. OPNsense REST API with an
   API key and secret from the environment or an owner-only file; TLS always
   verified.
-- **Phase 2 — governed writes:** aliases, then firewall rules, through mecmcp's
-  change sets (plan, digest, human approval, apply with a drift check).
+- **Phase 2a — governed writes, aliases:** create/update/delete firewall
+  aliases through mecmcp's change sets (plan, digest, human approval, apply
+  with a drift check). OPNsense has no candidate configuration, so writes
+  persist to `config.xml` immediately and only take effect once `apply`
+  calls `reconfigure`; a partial apply is a reachable outcome.
+- **Phase 2b — governed writes, firewall rules:** the same lifecycle,
+  extended to firewall filter rules. Not yet started.
 
 Design and scope: [mecmcp#425](https://github.com/fastrevmd-lab/mecmcp/issues/425).
 
