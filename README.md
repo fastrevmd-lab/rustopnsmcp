@@ -1,3 +1,6 @@
+> [!WARNING]
+> 🚧 **Under construction — not operational.** `rustopnsmcp` is in early development and is not ready for use. Tools, configuration and APIs will change without notice. Do not deploy it against a real OPNsense firewall.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/mechub-mark.svg">
