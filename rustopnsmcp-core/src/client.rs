@@ -448,6 +448,18 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback delete {uuid}: no prior value"))
                 })?;
+                // This runs whenever reconciliation read an indeterminate
+                // delete as `NotApplied` or errored outright — either of
+                // which can be wrong, the same way an update's `NotApplied`
+                // read can be wrong (see `flatten_for_write`'s field-order
+                // sensitivity). If the alias is still there under this same
+                // uuid, the delete never landed and there is nothing to
+                // restore; re-creating it anyway would leave a duplicate
+                // under a fresh uuid rather than the idempotent no-op this
+                // rollback is supposed to be.
+                if self.fetch_alias(uuid).await?.is_some() {
+                    return Ok(());
+                }
                 // `uuid` is not in `WRITABLE_FIELDS`, so flattening also
                 // drops the bookkeeping key `get_alias_item` inserted; the
                 // device assigns a fresh one on re-create.

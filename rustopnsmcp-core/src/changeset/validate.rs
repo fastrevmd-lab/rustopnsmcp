@@ -104,6 +104,64 @@ pub fn check_writable_fields(mutations: &[StagedMutation]) -> Result<(), Opnsens
     Ok(())
 }
 
+/// Staged fields whose value is really a set, written as one string: OPNsense
+/// accepts (and its own `getItem` response settles into) a sorted,
+/// deduplicated list joined by a fixed separator.
+const MULTI_VALUE_FIELDS: &[(&str, &str)] =
+    &[("content", "\n"), ("proto", ","), ("categories", ",")];
+
+/// Canonicalize one multi-value field's raw string to the sorted,
+/// deduplicated, fixed-separator form [`flatten_for_write`] recovers from a
+/// landed write.
+///
+/// Accepts either separator on input (callers may stage `content` as
+/// newline- or comma-joined) so the canonical form does not depend on which
+/// one a caller happened to use.
+fn canonicalize_multi_value(raw: &str, separator: &str) -> String {
+    let mut parts: Vec<&str> = raw
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    parts.join(separator)
+}
+
+/// Canonicalize multi-value fields (`content`, `proto`, `categories`) in
+/// every staged create/update body.
+///
+/// Must run before a mutation is staged (persisted into a change set a human
+/// can approve): the plan, its digest, the preview, and later
+/// reconciliation (`client::reconcile_indeterminate`) and verification
+/// (`apply::verify_applied`) all compare the staged body against
+/// [`flatten_for_write`]'s output, which is always sorted and
+/// fixed-separator. Without this, a staged value that landed correctly but
+/// was written in a different order or with a different separator reads as a
+/// mismatch purely from formatting — misreporting a landed update as
+/// `NotApplied` during indeterminate reconciliation, or as
+/// `AppliedUnverified` during post-apply verification.
+pub fn canonicalize_mutations(mutations: &mut [StagedMutation]) {
+    for mutation in mutations {
+        let body = match mutation {
+            StagedMutation::Create { body } | StagedMutation::Update { body, .. } => body,
+            StagedMutation::Delete { .. } => continue,
+        };
+        let Some(object) = body.as_object_mut() else {
+            continue;
+        };
+        for (field, separator) in MULTI_VALUE_FIELDS {
+            if let Some(canonical) = object
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .map(|raw| canonicalize_multi_value(raw, separator))
+            {
+                object.insert((*field).to_owned(), serde_json::Value::String(canonical));
+            }
+        }
+    }
+}
+
 /// Flatten a `getItem`-shaped alias body into the flat shape
 /// `addItem`/`setItem` accept.
 ///
@@ -327,5 +385,67 @@ mod tests {
     fn flatten_for_write_on_a_non_object_returns_it_unchanged() {
         let value = json!("not an object");
         assert_eq!(flatten_for_write(&value), value);
+    }
+
+    /// A staged `content` in a different order, or comma-separated rather
+    /// than newline-separated, must be rewritten to exactly the sorted,
+    /// newline-joined form `flatten_for_write` recovers from a landed write
+    /// — otherwise a value that lands correctly reads as `NotApplied` during
+    /// indeterminate reconciliation, or `AppliedUnverified` during
+    /// post-apply verification, purely because of formatting.
+    #[test]
+    fn canonicalize_mutations_normalizes_unsorted_and_comma_separated_content() {
+        use super::canonicalize_mutations;
+
+        let mut unsorted = vec![StagedMutation::update(
+            "u1",
+            json!({"content": "10.0.0.2\n10.0.0.1"}),
+        )];
+        canonicalize_mutations(&mut unsorted);
+        assert_eq!(
+            unsorted[0].clone(),
+            StagedMutation::update("u1", json!({"content": "10.0.0.1\n10.0.0.2"}))
+        );
+
+        let mut comma_separated = vec![StagedMutation::create(json!({
+            "name": "web_servers",
+            "type": "host",
+            "content": "10.0.0.2,10.0.0.1",
+        }))];
+        canonicalize_mutations(&mut comma_separated);
+        let StagedMutation::Create { body } = &comma_separated[0] else {
+            unreachable!("staged as a create");
+        };
+        assert_eq!(body.get("content"), Some(&json!("10.0.0.1\n10.0.0.2")));
+    }
+
+    /// `proto` and `categories` are comma-joined, not newline-joined, and
+    /// must canonicalize to that separator regardless of what order or
+    /// separator the caller staged them with. Duplicates are also collapsed,
+    /// since the device's own `getItem` response never repeats a selection.
+    #[test]
+    fn canonicalize_mutations_normalizes_proto_and_categories() {
+        use super::canonicalize_mutations;
+
+        let mut mutations = vec![StagedMutation::update(
+            "u1",
+            json!({"proto": "IPv6,IPv4,IPv4", "categories": "b\na"}),
+        )];
+        canonicalize_mutations(&mut mutations);
+        let StagedMutation::Update { body, .. } = &mutations[0] else {
+            unreachable!("staged as an update");
+        };
+        assert_eq!(body.get("proto"), Some(&json!("IPv4,IPv6")));
+        assert_eq!(body.get("categories"), Some(&json!("a,b")));
+    }
+
+    /// A delete has no body to canonicalize and must not panic.
+    #[test]
+    fn canonicalize_mutations_skips_deletes() {
+        use super::canonicalize_mutations;
+
+        let mut mutations = vec![StagedMutation::delete("u1")];
+        canonicalize_mutations(&mut mutations);
+        assert_eq!(mutations, vec![StagedMutation::delete("u1")]);
     }
 }

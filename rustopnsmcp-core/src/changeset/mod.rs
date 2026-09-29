@@ -28,7 +28,9 @@ pub use record::{
     StagedAction, actions_for, actions_of, fingerprint_of, mutations_of, preimage_of,
 };
 pub use rollback::rollback_to_preimage;
-pub use validate::{check_writable_fields, flatten_for_write, validate_locally};
+pub use validate::{
+    canonicalize_mutations, check_writable_fields, flatten_for_write, validate_locally,
+};
 
 // The shared crate exports `Atomicity` and `DeviceTransaction::atomicity()`,
 // so this crate re-exports the shared type rather than defining an

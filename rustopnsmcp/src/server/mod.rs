@@ -22,8 +22,8 @@ use rmcp::{
 use rustopnsmcp_core::{
     changeset::{
         OpnsenseTransaction, Preimage, StagedMutation, State, actions_for, apply_sequentially,
-        check_writable_fields, diff_against_preimage, fingerprint_of, mutations_of, preimage_of,
-        validate_locally,
+        canonicalize_mutations, check_writable_fields, diff_against_preimage, fingerprint_of,
+        mutations_of, preimage_of, validate_locally,
     },
     client::OpnsenseClient,
     error::OpnsenseError,
@@ -867,6 +867,13 @@ impl OpnsenseServer {
                 changeset::MutationSpec::Delete { uuid } => StagedMutation::delete(uuid),
             });
         }
+
+        // Canonicalize multi-value fields (content/proto/categories) before
+        // anything downstream — the digest, the preview, and reconciliation
+        // and verification checks after apply — ever sees them, so a staged
+        // value that lands correctly cannot read as a mismatch purely
+        // because of the order or separator the caller used.
+        canonicalize_mutations(&mut mutations);
 
         // Checked over the whole plan, not only the new mutations, and before
         // the pre-image is captured: a mutation setting a disallowed field

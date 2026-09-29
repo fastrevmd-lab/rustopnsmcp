@@ -792,4 +792,40 @@ mod tests {
         let failure = outcome.verification_failure.expect("must report a failure");
         assert!(failure.contains("content"), "{failure}");
     }
+
+    /// A staged `content` given unsorted or comma-separated, once
+    /// `canonicalize_mutations` runs on it at staging time (as
+    /// `opnsense_stage_change` does), must verify as `Applied` — not
+    /// `AppliedUnverified` — against a device that echoes it back sorted and
+    /// newline-joined. Before canonicalization existed, this staged value
+    /// would have read as a `content` mismatch purely from formatting, even
+    /// though it landed correctly.
+    #[tokio::test]
+    async fn a_canonicalized_unsorted_content_update_verifies_as_applied() {
+        let controller = MockController::new();
+        controller.apply_results.lock().unwrap().push_back(Ok(None));
+        controller
+            .fetch_alias_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(Some(
+                serde_json::json!({"name": "web_servers", "content": "10.0.0.1\n10.0.0.2"}),
+            )));
+
+        let preimage = Preimage::from_resources(vec![serde_json::json!({
+            "uuid": "u1",
+            "name": "web_servers",
+            "content": "10.0.0.9",
+        })]);
+        let mut mutations = vec![StagedMutation::update(
+            "u1",
+            serde_json::json!({"name": "web_servers", "content": "10.0.0.2,10.0.0.1"}),
+        )];
+        super::super::validate::canonicalize_mutations(&mut mutations);
+
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::Applied);
+        assert!(outcome.verification_failure.is_none());
+    }
 }
