@@ -158,20 +158,34 @@ impl OpnsenseClient {
     pub async fn get_alias_item(&self, uuid: &str) -> Result<serde_json::Value, OpnsenseError> {
         validate_uuid(uuid)?;
         let raw = self.get(&endpoints::aliases_get_item(uuid)).await?;
+        interpret_get_item_response(raw, uuid)
+    }
 
-        let mut body = match raw.get("alias") {
-            Some(alias) if alias.is_object() => alias.clone(),
-            _ => raw,
+    /// Search for an alias by exact name.
+    ///
+    /// Used to reconcile a `create` whose response was lost to a transport
+    /// failure: the device may have persisted it even though this process
+    /// never saw a confirming response, and this is the only way to check
+    /// without a UUID to fetch by.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::post`].
+    async fn find_alias_uuid_by_name(&self, name: &str) -> Result<Option<String>, OpnsenseError> {
+        let body = serde_json::json!({
+            "current": 1,
+            "rowCount": 50,
+            "searchPhrase": name,
+        });
+        let raw = self.post(endpoints::ALIASES_SEARCH, &body).await?;
+        let Some(rows) = raw.get("rows").and_then(serde_json::Value::as_array) else {
+            return Ok(None);
         };
-
-        let object = body.as_object_mut().ok_or_else(|| {
-            OpnsenseError::Malformed("getItem response has no alias object".to_owned())
-        })?;
-        object.insert(
-            "uuid".to_owned(),
-            serde_json::Value::String(uuid.to_owned()),
-        );
-        Ok(body)
+        Ok(rows
+            .iter()
+            .find(|row| row.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .and_then(|row| row.get("uuid").and_then(serde_json::Value::as_str))
+            .map(str::to_owned))
     }
 
     /// Create a firewall alias.
@@ -254,13 +268,7 @@ impl OpnsenseClient {
         let raw = self
             .post(endpoints::ALIASES_RECONFIGURE, &serde_json::json!({}))
             .await?;
-        match raw.get("status").and_then(serde_json::Value::as_str) {
-            None | Some("ok") => Ok(()),
-            Some(_) => Err(OpnsenseError::WriteRefused(format!(
-                "reconfigure did not report success: {}",
-                crate::error::sanitize_detail(&raw.to_string())
-            ))),
-        }
+        interpret_reconfigure_response(&raw)
     }
 
     /// Require an `addItem`/`setItem` response to report `result: "saved"`.
@@ -277,6 +285,81 @@ impl OpnsenseClient {
             "device rejected the write: {}",
             crate::error::sanitize_detail(&detail)
         )))
+    }
+}
+
+/// Interpret a raw `getItem` response into the pre-image shape.
+///
+/// OPNsense's `getItem` wraps the item's fields under a top-level `"alias"`
+/// key and does not echo the UUID back into the body, so this unwraps that
+/// envelope and inserts `uuid` itself, which is what
+/// [`crate::changeset::Preimage`] keys entries by.
+///
+/// OPNsense answers an unknown UUID with HTTP 200 and a bare `[]`, not a 404
+/// status — a device response this crate's HTTP layer never turns into an
+/// error — so that shape must be translated into the same "not found" signal
+/// callers of [`crate::changeset::ControllerOps::fetch_alias`] already expect
+/// from a real 404. Without this, every delete would be misread as having
+/// left the alias in place.
+///
+/// A URL-table alias's body can carry `username`/`password` for an
+/// authenticated fetch. Those fields are dropped here, at the one place every
+/// pre-image is built, rather than trusted to `WRITABLE_FIELDS` or the
+/// caller: the pre-image is echoed back in previews and persisted in the
+/// change-set store, and neither is a place for a credential to end up.
+///
+/// # Errors
+///
+/// Returns [`OpnsenseError::Upstream`] with `status: 404` for an empty-array
+/// response, and [`OpnsenseError::Malformed`] if the response has no
+/// `"alias"` object.
+fn interpret_get_item_response(
+    raw: serde_json::Value,
+    uuid: &str,
+) -> Result<serde_json::Value, OpnsenseError> {
+    if matches!(&raw, serde_json::Value::Array(items) if items.is_empty()) {
+        return Err(OpnsenseError::Upstream {
+            status: 404,
+            detail: "alias not found".to_owned(),
+        });
+    }
+
+    let Some(alias) = raw.get("alias").filter(|value| value.is_object()) else {
+        return Err(OpnsenseError::Malformed(
+            "getItem response has no alias object".to_owned(),
+        ));
+    };
+
+    let mut body = alias.clone();
+    let object = body
+        .as_object_mut()
+        .expect("checked is_object via filter above");
+    object.remove("username");
+    object.remove("password");
+    object.insert(
+        "uuid".to_owned(),
+        serde_json::Value::String(uuid.to_owned()),
+    );
+    Ok(body)
+}
+
+/// Interpret a raw `reconfigure` response.
+///
+/// A missing `status` field is not evidence of success — only an explicit
+/// `"ok"` is. Treating an ambiguous or absent field as success is exactly the
+/// "probably fine" default this server must not take: a genuine failure with
+/// a differently-shaped body would otherwise be recorded as `Applied`.
+///
+/// # Errors
+///
+/// Returns [`OpnsenseError::WriteRefused`] for anything but `status: "ok"`.
+fn interpret_reconfigure_response(raw: &serde_json::Value) -> Result<(), OpnsenseError> {
+    match raw.get("status").and_then(serde_json::Value::as_str) {
+        Some("ok") => Ok(()),
+        _ => Err(OpnsenseError::WriteRefused(format!(
+            "reconfigure did not report success: {}",
+            crate::error::sanitize_detail(&raw.to_string())
+        ))),
     }
 }
 
@@ -333,7 +416,7 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
         prior_value: Option<&serde_json::Value>,
         created_uuid: Option<&str>,
     ) -> Result<(), OpnsenseError> {
-        use crate::changeset::StagedMutation;
+        use crate::changeset::{StagedMutation, flatten_for_write};
 
         match mutation {
             StagedMutation::Create { .. } => {
@@ -346,19 +429,21 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback update {uuid}: no prior value"))
                 })?;
-                self.set_alias(uuid, prior).await
+                // `prior` is `getItem` shape (option fields as `{value,
+                // selected}` maps); `setItem` requires the flat shape.
+                // Replaying it verbatim either gets refused as malformed or
+                // silently drops a field.
+                self.set_alias(uuid, &flatten_for_write(prior)).await
             }
             StagedMutation::Delete { uuid } => {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback delete {uuid}: no prior value"))
                 })?;
-                // `uuid` was inserted by `get_alias_item` for our own
-                // bookkeeping; the device assigns a fresh one on re-create.
-                let mut restore_body = prior.clone();
-                if let Some(object) = restore_body.as_object_mut() {
-                    object.remove("uuid");
-                }
-                self.add_alias(&restore_body).await.map(|_| ())
+                // Flattened for the same reason as the update arm above.
+                // `uuid` is not in `WRITABLE_FIELDS`, so flattening also
+                // drops the bookkeeping key `get_alias_item` inserted; the
+                // device assigns a fresh one on re-create.
+                self.add_alias(&flatten_for_write(prior)).await.map(|_| ())
             }
         }
     }
@@ -396,6 +481,45 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
 
     async fn reconfigure(&self) -> Result<(), OpnsenseError> {
         self.reconfigure_aliases().await
+    }
+
+    async fn reconcile_indeterminate(
+        &self,
+        mutation: &crate::changeset::StagedMutation,
+    ) -> Result<crate::changeset::Reconciled, OpnsenseError> {
+        use crate::changeset::{Reconciled, StagedMutation, flatten_for_write};
+
+        match mutation {
+            StagedMutation::Create { body } => {
+                let Some(name) = body.get("name").and_then(serde_json::Value::as_str) else {
+                    return Ok(Reconciled::NotApplied);
+                };
+                Ok(match self.find_alias_uuid_by_name(name).await? {
+                    Some(uuid) => Reconciled::Applied(Some(uuid)),
+                    None => Reconciled::NotApplied,
+                })
+            }
+            StagedMutation::Update { uuid, body } => {
+                let Some(current) = self.fetch_alias(uuid).await? else {
+                    return Ok(Reconciled::NotApplied);
+                };
+                let flattened = flatten_for_write(&current);
+                let landed = body.as_object().is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .all(|(key, value)| flattened.get(key) == Some(value))
+                });
+                Ok(if landed {
+                    Reconciled::Applied(None)
+                } else {
+                    Reconciled::NotApplied
+                })
+            }
+            StagedMutation::Delete { uuid } => Ok(match self.fetch_alias(uuid).await? {
+                None => Reconciled::Applied(None),
+                Some(_) => Reconciled::NotApplied,
+            }),
+        }
     }
 }
 
@@ -486,5 +610,76 @@ mod tests {
     fn require_saved_accepts_result_saved() {
         let raw = serde_json::json!({"result": "saved", "uuid": "x"});
         assert!(OpnsenseClient::require_saved(&raw).is_ok());
+    }
+
+    /// OPNsense answers an unknown UUID with HTTP 200 and a bare `[]`, not a
+    /// 404 — without this translation, `fetch_alias`'s `Ok(None)` arm (which
+    /// only fires on a real 404) can never be reached, and every successful
+    /// delete would be misread as having left the alias in place.
+    #[test]
+    fn get_item_interprets_an_empty_array_as_not_found() {
+        let raw = serde_json::json!([]);
+        let error = super::interpret_get_item_response(raw, "u1").expect_err("must be refused");
+        assert!(
+            matches!(
+                error,
+                crate::error::OpnsenseError::Upstream { status: 404, .. }
+            ),
+            "{error}"
+        );
+    }
+
+    /// A response with no `"alias"` object — the fallback the old code took
+    /// instead of refusing — must be rejected rather than silently accepted
+    /// as the alias body.
+    #[test]
+    fn get_item_rejects_a_response_with_no_alias_object() {
+        let raw = serde_json::json!({"unrelated": true});
+        assert!(super::interpret_get_item_response(raw, "u1").is_err());
+    }
+
+    /// A well-formed response is unwrapped from its `"alias"` envelope and
+    /// gets the UUID inserted, since `getItem` never echoes it back.
+    #[test]
+    fn get_item_unwraps_the_alias_envelope_and_inserts_the_uuid() {
+        let raw = serde_json::json!({"alias": {"name": "web_servers"}});
+        let body = super::interpret_get_item_response(raw, "u1").expect("parses");
+        assert_eq!(body.get("name"), Some(&serde_json::json!("web_servers")));
+        assert_eq!(body.get("uuid"), Some(&serde_json::json!("u1")));
+    }
+
+    /// A URL-table alias's `username`/`password` must never survive into the
+    /// pre-image: it is echoed back in previews and persisted in the
+    /// change-set store, and neither is a place for a credential to end up.
+    #[test]
+    fn get_item_strips_username_and_password_from_the_body() {
+        let raw = serde_json::json!({
+            "alias": {
+                "name": "blocklist",
+                "type": "urltable",
+                "content": "https://example.org/list.txt",
+                "username": "svc-account",
+                "password": "hunter2",
+            }
+        });
+        let body = super::interpret_get_item_response(raw, "u1").expect("parses");
+        assert!(body.get("username").is_none());
+        assert!(body.get("password").is_none());
+        assert_eq!(body.get("name"), Some(&serde_json::json!("blocklist")));
+    }
+
+    /// A missing `status` field must not be read as success — only an
+    /// explicit `"ok"` is accepted, so a genuine failure with a
+    /// differently-shaped body cannot be misrecorded as applied.
+    #[test]
+    fn reconfigure_requires_an_explicit_ok_status() {
+        assert!(
+            super::interpret_reconfigure_response(&serde_json::json!({"status": "ok"})).is_ok()
+        );
+        assert!(super::interpret_reconfigure_response(&serde_json::json!({})).is_err());
+        assert!(
+            super::interpret_reconfigure_response(&serde_json::json!({"status": "failed"}))
+                .is_err()
+        );
     }
 }

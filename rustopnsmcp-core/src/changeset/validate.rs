@@ -15,7 +15,7 @@ use super::preimage::{Preimage, StagedMutation};
 /// `uuid` is deliberately absent: it is the controller-assigned address a
 /// mutation's `uuid` field already carries, not a body field a caller can set
 /// or change.
-const WRITABLE_FIELDS: &[&str] = &[
+pub(crate) const WRITABLE_FIELDS: &[&str] = &[
     "name",
     "type",
     "content",
@@ -83,6 +83,77 @@ pub fn check_writable_fields(mutations: &[StagedMutation]) -> Result<(), Opnsens
     Ok(())
 }
 
+/// Flatten a `getItem`-shaped alias body into the flat shape
+/// `addItem`/`setItem` accept.
+///
+/// OPNsense's MVC controllers echo option and list fields back from
+/// `getItem` as a map of `{value: label, selected: 0|1}` per choice (for
+/// example `type`, `proto`, `interface`, `categories`, `content`), not as the
+/// flat string or comma-list `setItem` requires. Replaying a `getItem` body
+/// verbatim into `setItem`/`addItem` — which is exactly what rollback does —
+/// either gets refused as malformed or, worse, silently drops the field.
+///
+/// Only the writable field set survives into the result: a pre-image can carry
+/// read-only fields (`uuid`, computed counters, and so on) that must never be
+/// replayed into a write.
+///
+/// # Errors
+///
+/// Never returns an error. A field whose shape this function does not
+/// recognise (neither a flat scalar nor a `{value, selected}` map) is passed
+/// through unchanged rather than dropped, since refusing silently would be
+/// worse than an odd value `setItem` can reject on its own.
+#[must_use]
+pub fn flatten_for_write(get_item: &serde_json::Value) -> serde_json::Value {
+    let mut flat = serde_json::Map::new();
+
+    let Some(object) = get_item.as_object() else {
+        return get_item.clone();
+    };
+
+    for field in WRITABLE_FIELDS {
+        let Some(value) = object.get(*field) else {
+            continue;
+        };
+        flat.insert((*field).to_owned(), flatten_field(field, value));
+    }
+
+    serde_json::Value::Object(flat)
+}
+
+/// Flatten one field's value from `getItem` shape to `setItem` shape.
+fn flatten_field(field: &str, value: &serde_json::Value) -> serde_json::Value {
+    let Some(options) = value.as_object() else {
+        return value.clone();
+    };
+
+    // A flat scalar never round-trips as a JSON object; a `{value, selected}`
+    // choice map always does. Anything else here is not this shape, so it is
+    // passed through unchanged rather than mangled.
+    let is_choice_map = options
+        .values()
+        .all(|choice| choice.is_object() && choice.get("selected").is_some());
+    if !is_choice_map {
+        return value.clone();
+    }
+
+    let separator = if field == "content" { "\n" } else { "," };
+
+    let mut selected: Vec<&str> = options
+        .iter()
+        .filter(|(_, choice)| {
+            matches!(
+                choice.get("selected"),
+                Some(serde_json::Value::Number(n)) if n.as_i64() == Some(1)
+            ) || matches!(choice.get("selected"), Some(serde_json::Value::String(s)) if s == "1")
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    selected.sort_unstable();
+
+    serde_json::Value::String(selected.join(separator))
+}
+
 /// Refuse a plan naming a mutation the pre-image does not cover.
 ///
 /// A mutation outside the pre-image is either a plan built against the wrong
@@ -109,7 +180,7 @@ pub fn validate_locally(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_writable_fields, validate_locally};
+    use super::{check_writable_fields, flatten_for_write, validate_locally};
     use crate::changeset::{Preimage, StagedMutation};
     use serde_json::json;
 
@@ -158,5 +229,61 @@ mod tests {
         let preimage = Preimage::from_resources(vec![json!({"uuid": "a"})]);
         let mutations = vec![StagedMutation::update("b", json!({}))];
         assert!(validate_locally(&preimage, &mutations).is_err());
+    }
+
+    /// A realistic `getItem` response for a host alias: option fields come
+    /// back as `{value, selected}` maps, not flat strings. Replaying this
+    /// verbatim into `setItem` (what rollback used to do) would either be
+    /// refused as malformed or silently drop the field; flattening must
+    /// recover the flat shape `setItem` actually accepts.
+    #[test]
+    fn flatten_for_write_recovers_setitem_shape_from_getitem_shape() {
+        let get_item = json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "name": "web_servers",
+            "type": {
+                "host": {"value": "Host(s)", "selected": 1},
+                "network": {"value": "Network(s)", "selected": 0},
+                "urltable": {"value": "URL Table", "selected": 0},
+            },
+            "content": {
+                "10.0.0.1": {"value": "10.0.0.1", "selected": 1},
+                "10.0.0.2": {"value": "10.0.0.2", "selected": 1},
+            },
+            "proto": {
+                "IPv4": {"value": "IPv4", "selected": 1},
+                "IPv6": {"value": "IPv6", "selected": 0},
+            },
+            "description": "web servers",
+            "enabled": "1",
+        });
+
+        let flat = flatten_for_write(&get_item);
+
+        assert_eq!(flat.get("name"), Some(&json!("web_servers")));
+        assert_eq!(flat.get("type"), Some(&json!("host")));
+        assert_eq!(flat.get("content"), Some(&json!("10.0.0.1\n10.0.0.2")));
+        assert_eq!(flat.get("proto"), Some(&json!("IPv4")));
+        assert_eq!(flat.get("description"), Some(&json!("web servers")));
+        assert_eq!(flat.get("enabled"), Some(&json!("1")));
+        // `uuid` is not writable and must not survive flattening.
+        assert!(flat.get("uuid").is_none());
+    }
+
+    /// A field this function does not recognise as either shape is passed
+    /// through unchanged rather than dropped or mangled.
+    #[test]
+    fn flatten_for_write_passes_through_unrecognised_shapes() {
+        let get_item = json!({"name": "x", "counters": 42});
+        let flat = flatten_for_write(&get_item);
+        assert_eq!(flat.get("counters"), Some(&json!(42)));
+    }
+
+    /// A non-object input (defensive: `getItem` should always return an
+    /// object) must not panic.
+    #[test]
+    fn flatten_for_write_on_a_non_object_returns_it_unchanged() {
+        let value = json!("not an object");
+        assert_eq!(flatten_for_write(&value), value);
     }
 }

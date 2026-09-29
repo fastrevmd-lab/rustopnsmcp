@@ -62,6 +62,33 @@ impl From<mecmcp_http::HttpError> for OpnsenseError {
     }
 }
 
+impl OpnsenseError {
+    /// Whether this error leaves it unknown if the device actually received
+    /// and applied the request, as opposed to a definite outcome (a rejected
+    /// write, or a request that never reached the device).
+    ///
+    /// A request can fail after the device has already persisted it to
+    /// `config.xml` — a response timeout, a dropped connection mid-read, or a
+    /// body the client refused to buffer all describe *this process* losing
+    /// track of the answer, not the device refusing the write. Treating those
+    /// the same as a definite rejection (skip it, roll back only what came
+    /// before it) can leave an orphaned write neither reported nor undone.
+    /// `Connect`, `QueueFull`, and `LimiterClosed` are excluded: the request
+    /// never left this process, so the device cannot have acted on it.
+    #[must_use]
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(
+            self,
+            Self::Http(
+                mecmcp_http::HttpError::Timeout { .. }
+                    | mecmcp_http::HttpError::RequestFailed { .. }
+                    | mecmcp_http::HttpError::BodyRead { .. }
+                    | mecmcp_http::HttpError::ResponseTooLarge { .. }
+            )
+        )
+    }
+}
+
 /// Render the class of HTTP failure without the URL.
 fn http_error_class(error: &mecmcp_http::HttpError) -> String {
     use mecmcp_http::HttpError;
@@ -198,5 +225,60 @@ mod tests {
         let sanitized = super::sanitize_detail(raw);
         assert_eq!(sanitized, "shortline");
         assert!(!sanitized.contains("[truncated]"));
+    }
+
+    /// A timeout, a dropped connection mid-read, or an oversized response all
+    /// mean this process lost track of the answer, not that the device
+    /// refused the write — the request may already have landed. Apply must
+    /// treat these as "unknown", not as "did not happen".
+    #[test]
+    fn transport_failures_after_the_request_left_are_indeterminate() {
+        let url = mecmcp_http::SafeUrl::from_unparsed("https://opnsense.example/api/test");
+
+        let indeterminate = [
+            OpnsenseError::Http(mecmcp_http::HttpError::Timeout {
+                url: url.clone(),
+                timeout: std::time::Duration::from_secs(30),
+            }),
+            OpnsenseError::Http(mecmcp_http::HttpError::RequestFailed {
+                url: url.clone(),
+                detail: "connection reset".to_owned(),
+            }),
+            OpnsenseError::Http(mecmcp_http::HttpError::BodyRead {
+                url: url.clone(),
+                detail: "truncated".to_owned(),
+            }),
+            OpnsenseError::Http(mecmcp_http::HttpError::ResponseTooLarge {
+                limit: 1024,
+                url: url.clone(),
+            }),
+        ];
+        for error in indeterminate {
+            assert!(error.is_indeterminate(), "{error}");
+        }
+    }
+
+    /// A connect failure never left this process, and a definite device
+    /// rejection is not ambiguous either: neither must be treated as
+    /// indeterminate, or a plain failure would trigger needless
+    /// reconciliation round-trips.
+    #[test]
+    fn a_definite_outcome_is_not_indeterminate() {
+        let url = mecmcp_http::SafeUrl::from_unparsed("https://opnsense.example/api/test");
+
+        let definite = [
+            OpnsenseError::Http(mecmcp_http::HttpError::Connect {
+                url: url.clone(),
+                detail: "connection refused".to_owned(),
+            }),
+            OpnsenseError::WriteRefused("device rejected the write".to_owned()),
+            OpnsenseError::Upstream {
+                status: 500,
+                detail: "internal error".to_owned(),
+            },
+        ];
+        for error in definite {
+            assert!(!error.is_indeterminate(), "{error}");
+        }
     }
 }

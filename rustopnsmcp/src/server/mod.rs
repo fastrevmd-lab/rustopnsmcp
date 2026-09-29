@@ -387,6 +387,24 @@ impl OpnsenseServer {
         }
     }
 
+    /// Refuse a caller staging into a change set they do not own.
+    ///
+    /// Two-person control means the plan's author and its approver are
+    /// different principals. Without this check, any caller who names
+    /// another principal's change set id can stage additional mutations into
+    /// it, and a *different* principal approving afterward looks like a
+    /// genuine second reviewer when in fact one principal wrote the plan
+    /// content and the other only rubber-stamped it.
+    fn check_stager(principal: &str, owner: &str) -> Result<(), Box<CallToolResult>> {
+        if principal == owner {
+            Ok(())
+        } else {
+            Err(Box::new(tool_error(
+                "only the change set's creator may stage into it",
+            )))
+        }
+    }
+
     /// Refuse a plan the state file could not be reloaded with.
     fn check_plan_limits(record: &ChangeSetRecord) -> Result<(), Box<CallToolResult>> {
         let limits = crate::changeset_state::limits();
@@ -806,6 +824,10 @@ impl OpnsenseServer {
             },
             (None, None) => unreachable!("one of the two is always present"),
         };
+
+        if let Err(result) = Self::check_stager(&Self::principal(caller.as_ref()), &owner) {
+            return *result;
+        }
 
         let client = match self.client_for(&args.device) {
             Ok(client) => client,
@@ -1245,6 +1267,7 @@ impl OpnsenseServer {
             State::Partial => "partial",
             State::PartialRollbackFailed => "partial_rollback_failed",
             State::RefusedStale => "refused_stale",
+            State::NotLoaded => "not_loaded",
         };
 
         let succeeded = matches!(outcome.state, State::Applied | State::AppliedUnverified);
@@ -1465,6 +1488,17 @@ mod tests {
     fn write_tools_covers_the_change_set_lifecycle() {
         assert_eq!(WRITE_TOOLS.len(), 7);
         assert!(WRITE_TOOLS.contains(&"opnsense_apply_change_set"));
+    }
+
+    /// Two-person control depends on the plan's author and its approver
+    /// being different principals. Without this check, a second token could
+    /// stage its own mutations into someone else's change set and then
+    /// "approve" it — one principal writing and approving the same content
+    /// under the appearance of a second reviewer.
+    #[test]
+    fn only_the_owner_may_stage_into_their_own_change_set() {
+        assert!(OpnsenseServer::check_stager("alice", "alice").is_ok());
+        assert!(OpnsenseServer::check_stager("bob", "alice").is_err());
     }
 
     /// A stdio caller carries no verified token entry, so its actor type

@@ -40,6 +40,26 @@ pub enum State {
     PartialRollbackFailed,
     /// Apply was refused because the pre-image no longer matches.
     RefusedStale,
+    /// Every write landed in `config.xml` but `reconfigure` itself failed, so
+    /// nothing reached the live `pf` tables. The writes were rolled back, so
+    /// `config.xml` is back to the pre-image and this change set was not
+    /// applied.
+    NotLoaded,
+}
+
+/// Whether an indeterminate mutation actually reached the device.
+///
+/// Returned by [`ControllerOps::reconcile_indeterminate`], called only after
+/// [`ControllerOps::apply_mutation`] fails with an error
+/// [`crate::error::OpnsenseError::is_indeterminate`] reports as ambiguous — a
+/// transport failure that leaves it unknown whether the device received and
+/// acted on the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciled {
+    /// It did land. For a create, the device-assigned UUID.
+    Applied(Option<String>),
+    /// It did not land, as far as this check could tell.
+    NotApplied,
 }
 
 /// Operations a device must support for apply and rollback.
@@ -99,6 +119,20 @@ pub trait ControllerOps {
     fn reconfigure(
         &self,
     ) -> impl std::future::Future<Output = Result<(), crate::error::OpnsenseError>> + Send;
+
+    /// Determine whether a mutation that failed with an indeterminate error
+    /// actually reached the device.
+    ///
+    /// Called only when [`Self::apply_mutation`] returned an error
+    /// [`crate::error::OpnsenseError::is_indeterminate`] reports as
+    /// ambiguous. A timeout or a dropped response does not mean the write
+    /// never happened — the device may have already persisted it to
+    /// `config.xml` — so apply cannot simply treat it as "not attempted"
+    /// without checking.
+    fn reconcile_indeterminate(
+        &self,
+        mutation: &StagedMutation,
+    ) -> impl std::future::Future<Output = Result<Reconciled, crate::error::OpnsenseError>> + Send;
 }
 
 /// Apply staged mutations sequentially, then load them with `reconfigure`.
@@ -144,6 +178,30 @@ where
                     created_uuids.insert(index, uuid);
                 }
             }
+            Err(error) if error.is_indeterminate() => {
+                // This process lost track of the answer, not the device
+                // refusing the write — the request may already have landed.
+                // Check before assuming it did not, or a retried apply could
+                // leave an orphaned write neither reported nor undone.
+                match controller.reconcile_indeterminate(mutation).await {
+                    Ok(Reconciled::Applied(created_uuid)) => {
+                        succeeded.push(mutation.clone());
+                        if let Some(uuid) = created_uuid {
+                            created_uuids.insert(index, uuid);
+                        }
+                    }
+                    Ok(Reconciled::NotApplied) | Err(_) => {
+                        // Either it confirmed the write did not land, or the
+                        // reconciliation check itself failed. Both are the
+                        // fail-closed choice: stop and roll back what is
+                        // known to have succeeded rather than assume this one
+                        // is safe to leave alone.
+                        attempted_and_failed.push(mutation.clone());
+                        never_attempted.extend(mutations[index + 1..].iter().cloned());
+                        break;
+                    }
+                }
+            }
             Err(_) => {
                 attempted_and_failed.push(mutation.clone());
                 never_attempted.extend(mutations[index + 1..].iter().cloned());
@@ -182,25 +240,50 @@ where
     }
 
     // Every write landed; load them into the live pf tables and confirm.
-    let (state, verification_failure) = match controller.reconfigure().await {
-        Ok(()) => match verify_applied(controller, mutations, &created_uuids).await {
-            Ok(()) => (State::Applied, None),
-            Err(error) => (State::AppliedUnverified, Some(error.to_string())),
-        },
-        Err(error) => (
-            State::AppliedUnverified,
-            Some(format!("reconfigure failed: {error}")),
-        ),
-    };
-
-    Outcome {
-        state,
-        succeeded,
-        failed: Vec::new(),
-        attempted_and_failed: Vec::new(),
-        never_attempted: Vec::new(),
-        rollback_failures: Vec::new(),
-        verification_failure,
+    match controller.reconfigure().await {
+        Ok(()) => {
+            let (state, verification_failure) =
+                match verify_applied(controller, mutations, &created_uuids).await {
+                    Ok(()) => (State::Applied, None),
+                    Err(error) => (State::AppliedUnverified, Some(error.to_string())),
+                };
+            Outcome {
+                state,
+                succeeded,
+                failed: Vec::new(),
+                attempted_and_failed: Vec::new(),
+                never_attempted: Vec::new(),
+                rollback_failures: Vec::new(),
+                verification_failure,
+            }
+        }
+        Err(error) => {
+            // reconfigure itself failed: every write landed in config.xml but
+            // none reached the live pf tables, so this is not "applied" by
+            // any definition — it must not be recorded as one. Roll every
+            // write back so config.xml matches what is actually live.
+            let verification_failure = Some(format!("reconfigure failed: {error}"));
+            match rollback_to_preimage(controller, preimage, &succeeded, &created_uuids).await {
+                Ok(()) => Outcome {
+                    state: State::NotLoaded,
+                    succeeded: Vec::new(),
+                    failed: succeeded,
+                    attempted_and_failed: Vec::new(),
+                    never_attempted: Vec::new(),
+                    rollback_failures: Vec::new(),
+                    verification_failure,
+                },
+                Err(rollback_failures) => Outcome {
+                    state: State::PartialRollbackFailed,
+                    succeeded,
+                    failed: Vec::new(),
+                    attempted_and_failed: Vec::new(),
+                    never_attempted: Vec::new(),
+                    rollback_failures,
+                    verification_failure,
+                },
+            }
+        }
     }
 }
 
@@ -279,5 +362,239 @@ where
             failed_verifications.len(),
             failed_verifications.join("; ")
         )))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::error::OpnsenseError;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    fn timeout_error() -> OpnsenseError {
+        OpnsenseError::Http(mecmcp_http::HttpError::Timeout {
+            url: mecmcp_http::SafeUrl::from_unparsed("https://opnsense.example/api/test"),
+            timeout: std::time::Duration::from_secs(30),
+        })
+    }
+
+    /// A scripted controller for exercising `apply_sequentially` without a
+    /// device. Each queue is consumed in call order; a method called more
+    /// times than it was scripted for is a test bug, so those panic rather
+    /// than silently returning a default.
+    struct MockController {
+        apply_results: Mutex<VecDeque<Result<Option<String>, OpnsenseError>>>,
+        reconcile_results: Mutex<VecDeque<Reconciled>>,
+        fetch_alias_results: Mutex<VecDeque<Result<Option<serde_json::Value>, OpnsenseError>>>,
+        reconfigure_result: Mutex<Option<Result<(), OpnsenseError>>>,
+        rollback_fails: bool,
+        rollback_log: Mutex<Vec<String>>,
+    }
+
+    impl MockController {
+        fn new() -> Self {
+            Self {
+                apply_results: Mutex::new(VecDeque::new()),
+                reconcile_results: Mutex::new(VecDeque::new()),
+                fetch_alias_results: Mutex::new(VecDeque::new()),
+                reconfigure_result: Mutex::new(Some(Ok(()))),
+                rollback_fails: false,
+                rollback_log: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ControllerOps for MockController {
+        async fn apply_mutation(
+            &self,
+            _mutation: &StagedMutation,
+        ) -> Result<Option<String>, OpnsenseError> {
+            self.apply_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("apply_mutation called more times than scripted")
+        }
+
+        async fn rollback_mutation(
+            &self,
+            mutation: &StagedMutation,
+            _prior_value: Option<&serde_json::Value>,
+            _created_uuid: Option<&str>,
+        ) -> Result<(), OpnsenseError> {
+            self.rollback_log.lock().unwrap().push(mutation.preview());
+            if self.rollback_fails {
+                Err(OpnsenseError::WriteRefused("rollback refused".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn preimage_matches(
+            &self,
+            _preimage: &Preimage,
+            _mutations: &[StagedMutation],
+        ) -> Result<bool, OpnsenseError> {
+            Ok(true)
+        }
+
+        async fn fetch_alias(
+            &self,
+            _uuid: &str,
+        ) -> Result<Option<serde_json::Value>, OpnsenseError> {
+            self.fetch_alias_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(Some(serde_json::json!({}))))
+        }
+
+        async fn reconfigure(&self) -> Result<(), OpnsenseError> {
+            self.reconfigure_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("reconfigure called more times than scripted")
+        }
+
+        async fn reconcile_indeterminate(
+            &self,
+            _mutation: &StagedMutation,
+        ) -> Result<Reconciled, OpnsenseError> {
+            Ok(self
+                .reconcile_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("reconcile_indeterminate called more times than scripted"))
+        }
+    }
+
+    fn two_creates() -> Vec<StagedMutation> {
+        vec![
+            StagedMutation::create(serde_json::json!({"name": "a", "type": "host"})),
+            StagedMutation::create(serde_json::json!({"name": "b", "type": "host"})),
+        ]
+    }
+
+    /// A `reconfigure` failure means every write landed in `config.xml` but
+    /// never reached the live `pf` tables. Before this fix, that state was
+    /// recorded as `Applied`/`AppliedUnverified` and never rolled back —
+    /// unapproved writes stayed in `config.xml` and the next GUI apply would
+    /// load them. This is the regression test for that: the outcome must be
+    /// `NotLoaded`, not a success state, and every write must be undone.
+    #[tokio::test]
+    async fn a_reconfigure_failure_rolls_back_and_is_not_recorded_as_applied() {
+        let controller = MockController::new();
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .extend([Ok(Some("uuid-a".to_owned())), Ok(Some("uuid-b".to_owned()))]);
+        *controller.reconfigure_result.lock().unwrap() =
+            Some(Err(OpnsenseError::WriteRefused("boom".to_owned())));
+
+        let preimage = Preimage::from_resources(Vec::new());
+        let mutations = two_creates();
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::NotLoaded);
+        assert!(outcome.succeeded.is_empty());
+        assert_eq!(outcome.failed.len(), 2);
+        assert_eq!(controller.rollback_log.lock().unwrap().len(), 2);
+        // Rolled back in reverse order.
+        assert_eq!(
+            controller.rollback_log.lock().unwrap()[0],
+            mutations[1].preview()
+        );
+    }
+
+    /// If the rollback after a `reconfigure` failure itself fails, that must
+    /// surface as `PartialRollbackFailed` with the rollback failures
+    /// reported, not be swallowed into a success state.
+    #[tokio::test]
+    async fn a_reconfigure_failure_with_a_failed_rollback_reports_partial_rollback_failed() {
+        let mut controller = MockController::new();
+        controller.rollback_fails = true;
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .extend([Ok(Some("uuid-a".to_owned())), Ok(Some("uuid-b".to_owned()))]);
+        *controller.reconfigure_result.lock().unwrap() =
+            Some(Err(OpnsenseError::WriteRefused("boom".to_owned())));
+
+        let preimage = Preimage::from_resources(Vec::new());
+        let mutations = two_creates();
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::PartialRollbackFailed);
+        assert_eq!(outcome.rollback_failures.len(), 2);
+    }
+
+    /// A timeout on the first create does not mean it never happened: if
+    /// reconciliation confirms it landed, apply must continue rather than
+    /// treat a successful write as a failure and roll back unnecessarily.
+    #[tokio::test]
+    async fn an_indeterminate_write_that_landed_lets_apply_continue() {
+        let controller = MockController::new();
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .extend([Err(timeout_error()), Ok(Some("uuid-b".to_owned()))]);
+        controller
+            .reconcile_results
+            .lock()
+            .unwrap()
+            .push_back(Reconciled::Applied(Some("uuid-a".to_owned())));
+        // verify_applied fetches both created aliases afterwards.
+        controller.fetch_alias_results.lock().unwrap().extend([
+            Ok(Some(serde_json::json!({"name": "a"}))),
+            Ok(Some(serde_json::json!({"name": "b"}))),
+        ]);
+
+        let preimage = Preimage::from_resources(Vec::new());
+        let mutations = two_creates();
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::Applied);
+        assert_eq!(outcome.succeeded.len(), 2);
+        assert!(outcome.failed.is_empty());
+    }
+
+    /// A timeout on the first create that reconciliation confirms did *not*
+    /// land must behave exactly like a definite failure: stop, and roll back
+    /// nothing (there was nothing to roll back for that mutation) while
+    /// refusing to attempt the rest.
+    #[tokio::test]
+    async fn an_indeterminate_write_that_did_not_land_behaves_like_a_definite_failure() {
+        let controller = MockController::new();
+        controller
+            .apply_results
+            .lock()
+            .unwrap()
+            .extend([Ok(Some("uuid-a".to_owned())), Err(timeout_error())]);
+        controller
+            .reconcile_results
+            .lock()
+            .unwrap()
+            .push_back(Reconciled::NotApplied);
+
+        let preimage = Preimage::from_resources(Vec::new());
+        let mutations = two_creates();
+        let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
+
+        assert_eq!(outcome.state, State::Partial);
+        assert_eq!(outcome.succeeded.len(), 1);
+        assert_eq!(outcome.attempted_and_failed.len(), 1);
+        // Only the first (successful) mutation is rolled back.
+        assert_eq!(controller.rollback_log.lock().unwrap().len(), 1);
+        assert_eq!(
+            controller.rollback_log.lock().unwrap()[0],
+            mutations[0].preview()
+        );
     }
 }
