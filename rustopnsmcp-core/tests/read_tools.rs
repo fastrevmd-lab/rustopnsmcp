@@ -120,6 +120,131 @@ fn serve_fixtures(
     });
 }
 
+/// Like [`serve_fixtures`], but also records the HTTP method of the first
+/// request received for each path into `methods`.
+fn serve_fixtures_recording_methods(
+    listener: tokio::net::TcpListener,
+    server_config: rustls::ServerConfig,
+    routes: HashMap<String, serde_json::Value>,
+    methods: Arc<std::sync::Mutex<HashMap<String, String>>>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let routes = Arc::new(routes);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let routes = Arc::clone(&routes);
+            let methods = Arc::clone(&methods);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+
+                let mut header_bytes = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read_exact(&mut byte).await.is_ok() {
+                    header_bytes.push(byte[0]);
+                    if header_bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8_lossy(&header_bytes);
+                let request_line = headers.lines().next().unwrap_or("");
+                let method = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_owned();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_owned();
+
+                methods
+                    .lock()
+                    .expect("methods lock")
+                    .entry(path.clone())
+                    .or_insert(method);
+
+                if let Some(content_length) = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                {
+                    let mut body = vec![0u8; content_length];
+                    let _ = tls.read_exact(&mut body).await;
+                }
+
+                let response = match routes.get(&path) {
+                    Some(fixture) => {
+                        let body = fixture.to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                    None => {
+                        let body = format!(r#"{{"error":"no fixture for {path}"}}"#);
+                        format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                };
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.flush().await;
+            });
+        }
+    });
+}
+
+/// Answer every request with a fixed status and an empty JSON-ish body,
+/// regardless of path. Used to prove a non-2xx status becomes an error
+/// rather than being parsed as a success.
+fn serve_fixed_status(
+    listener: tokio::net::TcpListener,
+    server_config: rustls::ServerConfig,
+    status_line: &'static str,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+
+                let mut header_bytes = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read_exact(&mut byte).await.is_ok() {
+                    header_bytes.push(byte[0]);
+                    if header_bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let body = "redirected";
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nLocation: https://localhost/elsewhere\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.flush().await;
+            });
+        }
+    });
+}
+
 async fn bind_local() -> (tokio::net::TcpListener, u16) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -335,4 +460,66 @@ async fn an_unmapped_path_surfaces_as_an_upstream_error() {
     let client = client_against(HashMap::new()).await;
     let result = read::system_status(&client).await;
     assert!(result.is_err());
+}
+
+/// `firmware_status` must stay a GET. In OPNsense's `FirmwareController`, a
+/// POST to `statusAction` runs `configd firmware probe`, which makes the
+/// firewall contact its update mirror -- a side effect a read tool must never
+/// trigger. A future change that swaps this to POST (as the `search_*` tools
+/// use) must fail this test rather than ship silently.
+#[tokio::test]
+async fn firmware_status_uses_get_not_post() {
+    ensure_crypto_provider();
+    let (cert_pem, server_config) = tls_material();
+    let (listener, port) = bind_local().await;
+    let methods = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    serve_fixtures_recording_methods(
+        listener,
+        server_config,
+        default_routes(),
+        Arc::clone(&methods),
+    );
+
+    let ca_file = write_pem(&cert_pem);
+    let key_file = write_secret("test-key");
+    let secret_file = write_secret("test-secret");
+    let device = device_for(port, ca_file.path(), key_file.path(), secret_file.path());
+    let client = OpnsenseClient::new(device).expect("client builds");
+
+    read::firmware_status(&client)
+        .await
+        .expect("firmware status");
+
+    let recorded = methods.lock().expect("methods lock");
+    assert_eq!(
+        recorded.get(rustopnsmcp_core::endpoints::FIRMWARE_STATUS),
+        Some(&"GET".to_owned()),
+        "firmware_status must issue a GET, not a POST"
+    );
+}
+
+/// A 302 response must be treated as an `Upstream` error, not parsed as a
+/// success -- `mecmcp-http` does not auto-follow redirects, and this proves
+/// the client's own `status >= 300` check actually rejects one rather than
+/// only being exercised by a same-process closure.
+#[tokio::test]
+async fn a_redirect_response_is_an_upstream_error() {
+    ensure_crypto_provider();
+    let (cert_pem, server_config) = tls_material();
+    let (listener, port) = bind_local().await;
+    serve_fixed_status(listener, server_config, "302 Found");
+
+    let ca_file = write_pem(&cert_pem);
+    let key_file = write_secret("test-key");
+    let secret_file = write_secret("test-secret");
+    let device = device_for(port, ca_file.path(), key_file.path(), secret_file.path());
+    let client = OpnsenseClient::new(device).expect("client builds");
+
+    let result = read::system_status(&client).await;
+    match result {
+        Err(rustopnsmcp_core::error::OpnsenseError::Upstream { status, .. }) => {
+            assert_eq!(status, 302);
+        }
+        other => panic!("expected Upstream {{ status: 302, .. }}, got {other:?}"),
+    }
 }

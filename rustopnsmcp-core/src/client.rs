@@ -136,34 +136,29 @@ impl OpnsenseClient {
     }
 
     fn upstream_error(status: u16, body: &[u8]) -> OpnsenseError {
-        let detail = crate::error::sanitize_detail(&String::from_utf8_lossy(body));
+        let sanitized = crate::error::sanitize_detail(&String::from_utf8_lossy(body));
+        let detail = mecmcp_redact::redact_text(&sanitized);
         OpnsenseError::Upstream { status, detail }
     }
 }
 
 /// Build the `Authorization: Basic ...` header value from the API key and
 /// secret, without ever materializing the combined credential outside an
-/// `OutboundSecret`-owned value for longer than the encode itself takes.
+/// `OutboundSecret`-owned value, or a zeroized buffer, for longer than the
+/// encode itself takes.
 fn build_basic_auth(api_key: &OutboundSecret, api_secret: &OutboundSecret) -> OutboundSecret {
     use base64::Engine as _;
-    let combined = format!("{}:{}", api_key.expose(), api_secret.expose());
-    let encoded = base64::engine::general_purpose::STANDARD.encode(combined.as_bytes());
-    OutboundSecret::new_unchecked(format!("Basic {encoded}"))
+    use zeroize::Zeroizing;
+
+    let combined = Zeroizing::new(format!("{}:{}", api_key.expose(), api_secret.expose()));
+    let encoded =
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(combined.as_bytes()));
+    OutboundSecret::new_unchecked(format!("Basic {}", *encoded))
 }
 
 #[cfg(test)]
 mod tests {
     use super::OpnsenseClient;
-
-    /// A 3xx response must be treated as an error, not parsed as success.
-    #[test]
-    fn redirect_responses_are_errors() {
-        let is_error = |status: u16| status >= 300;
-        assert!(is_error(301), "301 redirect must be an error");
-        assert!(is_error(302), "302 redirect must be an error");
-        assert!(is_error(307), "307 redirect must be an error");
-        assert!(!is_error(200), "200 OK must not be an error");
-    }
 
     /// The Basic-auth header must combine key and secret with exactly one
     /// colon, base64-encoded, and it must never surface either value in

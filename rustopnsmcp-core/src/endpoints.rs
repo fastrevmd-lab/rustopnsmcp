@@ -23,6 +23,11 @@ pub const FIRMWARE_STATUS: &str = "/api/core/firmware/status";
 pub const INTERFACES_OVERVIEW: &str = "/api/interfaces/overview/interfacesInfo";
 
 /// Firewall filter rules, paginated search. Module `firewall`, controller `filter`.
+///
+/// `search_rule` iterates only the MVC ("automation") rule set. Legacy GUI
+/// rules are merged in starting with OPNsense 25.1; on 24.7 and earlier this
+/// endpoint returns a partial or empty list with nothing in the response to
+/// signal the gap.
 pub const FIREWALL_RULES_SEARCH: &str = "/api/firewall/filter/search_rule";
 
 /// Firewall aliases, paginated search. Module `firewall`, controller `alias`.
@@ -32,6 +37,10 @@ pub const ALIASES_SEARCH: &str = "/api/firewall/alias/search_item";
 pub const NAT_OUTBOUND_SEARCH: &str = "/api/firewall/source_nat/search_rule";
 
 /// 1:1 NAT rules, paginated search. Module `firewall`, controller `one_to_one`.
+///
+/// Outbound and 1:1 NAT only. Port forwards (destination NAT) have no
+/// covering endpoint here — `DNatController` exists only on core master, not
+/// on any released branch this phase targets.
 pub const NAT_ONE_TO_ONE_SEARCH: &str = "/api/firewall/one_to_one/search_rule";
 
 /// Static routes, paginated search. Module `routes`, controller `routes`.
@@ -41,6 +50,9 @@ pub const ROUTES_SEARCH: &str = "/api/routes/routes/search_route";
 pub const GATEWAYS_STATUS: &str = "/api/routes/gateway/status";
 
 /// DHCPv4 leases, paginated search. Module `dhcpv4`, controller `leases`.
+///
+/// ISC DHCPv4 only. Kea and Dnsmasq leases are not covered; new 25.x installs
+/// default to Dnsmasq, and ISC DHCPv4 is gone from core master.
 pub const DHCP_LEASES_SEARCH: &str = "/api/dhcpv4/leases/search_lease";
 
 /// Default page size for `search_*` endpoints when a tool call omits one.

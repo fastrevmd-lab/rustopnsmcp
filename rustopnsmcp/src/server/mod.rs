@@ -235,7 +235,10 @@ impl OpnsenseServer {
 
     #[tool(
         name = "opnsense_list_firewall_rules",
-        description = "OPNsense firewall filter rules, one page, optionally filtered by search_phrase"
+        description = "OPNsense firewall filter rules, one page, optionally filtered by \
+                        search_phrase. Legacy GUI rules are included only on OPNsense 25.1 \
+                        and later; on 24.7 and earlier this returns only MVC/automation rules \
+                        and may be incomplete."
     )]
     async fn opnsense_list_firewall_rules(
         &self,
@@ -285,7 +288,8 @@ impl OpnsenseServer {
 
     #[tool(
         name = "opnsense_list_nat_rules",
-        description = "OPNsense outbound and 1:1 NAT rules, one page each"
+        description = "OPNsense outbound and 1:1 NAT rules, one page each. Port forwards \
+                        (destination NAT) are NOT included."
     )]
     async fn opnsense_list_nat_rules(
         &self,
@@ -335,7 +339,8 @@ impl OpnsenseServer {
 
     #[tool(
         name = "opnsense_list_dhcp_leases",
-        description = "OPNsense DHCPv4 leases, one page, optionally filtered by search_phrase"
+        description = "OPNsense DHCPv4 leases, one page, optionally filtered by search_phrase. \
+                        ISC DHCPv4 only; Kea and Dnsmasq leases are NOT covered."
     )]
     async fn opnsense_list_dhcp_leases(
         &self,

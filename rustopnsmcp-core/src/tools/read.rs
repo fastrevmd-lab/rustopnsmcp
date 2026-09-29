@@ -37,6 +37,39 @@ pub struct SearchArgs {
     pub limit: Option<u32>,
 }
 
+/// Upper bound on `limit`. The 8 MiB transport-level response cap and the
+/// 512 KiB MCP result cap already bound the worst case; this exists so an
+/// oversized request is refused up front with a clear reason instead of
+/// silently truncated or left to those caps to absorb.
+const MAX_LIMIT: u32 = 1_000;
+
+/// Upper bound on `search_phrase`, in bytes.
+const MAX_SEARCH_PHRASE_BYTES: usize = 256;
+
+/// Reject an out-of-range `limit` or an oversized `search_phrase` before it
+/// reaches the device. Fail closed: no silent clamping.
+///
+/// # Errors
+/// Returns [`OpnsenseError::Config`] when either bound is exceeded.
+fn validate_search_args(args: &SearchArgs) -> Result<(), OpnsenseError> {
+    if let Some(limit) = args.limit
+        && !(1..=MAX_LIMIT).contains(&limit)
+    {
+        return Err(OpnsenseError::Config(format!(
+            "limit must be between 1 and {MAX_LIMIT}, got {limit}"
+        )));
+    }
+    if let Some(phrase) = &args.search_phrase
+        && phrase.len() > MAX_SEARCH_PHRASE_BYTES
+    {
+        return Err(OpnsenseError::Config(format!(
+            "search_phrase must be at most {MAX_SEARCH_PHRASE_BYTES} bytes, got {}",
+            phrase.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Build the standard `search_*` request body.
 fn search_body(args: &SearchArgs) -> serde_json::Value {
     serde_json::json!({
@@ -96,6 +129,7 @@ pub async fn list_firewall_rules(
     client: &OpnsenseClient,
     args: &SearchArgs,
 ) -> Result<serde_json::Value, OpnsenseError> {
+    validate_search_args(args)?;
     let raw = client
         .post(endpoints::FIREWALL_RULES_SEARCH, &search_body(args))
         .await?;
@@ -111,6 +145,7 @@ pub async fn list_aliases(
     client: &OpnsenseClient,
     args: &SearchArgs,
 ) -> Result<serde_json::Value, OpnsenseError> {
+    validate_search_args(args)?;
     let raw = client
         .post(endpoints::ALIASES_SEARCH, &search_body(args))
         .await?;
@@ -126,6 +161,7 @@ pub async fn list_routes(
     client: &OpnsenseClient,
     args: &SearchArgs,
 ) -> Result<serde_json::Value, OpnsenseError> {
+    validate_search_args(args)?;
     let raw = client
         .post(endpoints::ROUTES_SEARCH, &search_body(args))
         .await?;
@@ -141,6 +177,7 @@ pub async fn list_dhcp_leases(
     client: &OpnsenseClient,
     args: &SearchArgs,
 ) -> Result<serde_json::Value, OpnsenseError> {
+    validate_search_args(args)?;
     let raw = client
         .post(endpoints::DHCP_LEASES_SEARCH, &search_body(args))
         .await?;
@@ -160,6 +197,7 @@ pub async fn list_nat_rules(
     client: &OpnsenseClient,
     args: &SearchArgs,
 ) -> Result<serde_json::Value, OpnsenseError> {
+    validate_search_args(args)?;
     let body = search_body(args);
     let outbound_raw = client.post(endpoints::NAT_OUTBOUND_SEARCH, &body).await?;
     let one_to_one_raw = client.post(endpoints::NAT_ONE_TO_ONE_SEARCH, &body).await?;
@@ -176,7 +214,7 @@ pub async fn list_nat_rules(
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchArgs, search_body};
+    use super::{SearchArgs, search_body, validate_search_args};
 
     #[test]
     fn search_body_defaults_row_count_and_empty_phrase() {
@@ -201,5 +239,36 @@ mod tests {
         let body = search_body(&args);
         assert_eq!(body["rowCount"], 50);
         assert_eq!(body["searchPhrase"], "wan");
+    }
+
+    fn args_with(limit: Option<u32>, search_phrase: Option<String>) -> SearchArgs {
+        SearchArgs {
+            device: "fw".to_owned(),
+            search_phrase,
+            limit,
+        }
+    }
+
+    #[test]
+    fn validate_search_args_accepts_defaults_and_in_range_values() {
+        assert!(validate_search_args(&args_with(None, None)).is_ok());
+        assert!(validate_search_args(&args_with(Some(1), None)).is_ok());
+        assert!(validate_search_args(&args_with(Some(super::MAX_LIMIT), None)).is_ok());
+        assert!(validate_search_args(&args_with(None, Some("wan".to_owned()))).is_ok());
+    }
+
+    #[test]
+    fn validate_search_args_rejects_zero_and_oversized_limit() {
+        assert!(validate_search_args(&args_with(Some(0), None)).is_err());
+        assert!(validate_search_args(&args_with(Some(super::MAX_LIMIT + 1), None)).is_err());
+    }
+
+    #[test]
+    fn validate_search_args_rejects_oversized_search_phrase() {
+        let too_long = "x".repeat(super::MAX_SEARCH_PHRASE_BYTES + 1);
+        assert!(validate_search_args(&args_with(None, Some(too_long))).is_err());
+
+        let exactly_at_cap = "x".repeat(super::MAX_SEARCH_PHRASE_BYTES);
+        assert!(validate_search_args(&args_with(None, Some(exactly_at_cap))).is_ok());
     }
 }

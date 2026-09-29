@@ -93,22 +93,27 @@ fn http_error_class(error: &mecmcp_http::HttpError) -> String {
 
 /// Bound and sanitize server-supplied detail text.
 ///
-/// Caps the text to [`MAX_DETAIL_BYTES`] and strips control characters,
-/// including newlines and carriage returns, so a single-line error stays a
-/// single line. A hostile or merely broken upstream cannot inject unbounded
-/// text or forge log entries.
+/// Strips control characters, including newlines and carriage returns, so a
+/// single-line error stays a single line, then caps the result to
+/// [`MAX_DETAIL_BYTES`] on a `char` boundary. `[truncated]` is appended only
+/// when the byte cap was actually exceeded, not merely because control
+/// characters were stripped. A hostile or merely broken upstream cannot
+/// inject unbounded text or forge log entries.
 pub(crate) fn sanitize_detail(input: &str) -> String {
-    let bounded = input
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_DETAIL_BYTES)
-        .collect::<String>();
+    let filtered: String = input.chars().filter(|c| !c.is_control()).collect();
 
-    if bounded.len() < input.len() {
-        format!("{bounded} [truncated]")
-    } else {
-        bounded
+    if filtered.len() <= MAX_DETAIL_BYTES {
+        return filtered;
     }
+
+    let boundary = filtered
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= MAX_DETAIL_BYTES)
+        .last()
+        .unwrap_or(0);
+
+    format!("{} [truncated]", &filtered[..boundary])
 }
 
 #[cfg(test)]
@@ -176,5 +181,16 @@ mod tests {
         assert!(!sanitized.contains('\r'));
         assert!(sanitized.len() < raw.len());
         assert!(sanitized.ends_with("[truncated]"));
+    }
+
+    /// Stripping a control character alone, with the result still under the
+    /// byte cap, must not append `[truncated]` — that marker means the byte
+    /// cap was exceeded, not merely that a newline was removed.
+    #[test]
+    fn short_detail_with_control_chars_is_not_marked_truncated() {
+        let raw = "short\nline";
+        let sanitized = super::sanitize_detail(raw);
+        assert_eq!(sanitized, "shortline");
+        assert!(!sanitized.contains("[truncated]"));
     }
 }
