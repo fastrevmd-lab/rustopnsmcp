@@ -32,6 +32,12 @@ pub enum OpnsenseError {
     #[error("{0}")]
     Config(String),
 
+    /// A staged mutation was refused before it reached the device: a
+    /// disallowed field, a malformed UUID, or a resource kind this phase does
+    /// not govern.
+    #[error("write refused: {0}")]
+    WriteRefused(String),
+
     /// Transport, TLS, timeout, or rate-limit failure from `mecmcp-http`.
     ///
     /// The underlying error is classified and rendered without URLs, because

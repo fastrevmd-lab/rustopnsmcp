@@ -33,6 +33,48 @@ pub const FIREWALL_RULES_SEARCH: &str = "/api/firewall/filter/search_rule";
 /// Firewall aliases, paginated search. Module `firewall`, controller `alias`.
 pub const ALIASES_SEARCH: &str = "/api/firewall/alias/search_item";
 
+/// Create a firewall alias. Module `firewall`, controller `alias`.
+///
+/// Persists to `config.xml` immediately but does not take effect in the live
+/// `pf` tables until [`ALIASES_RECONFIGURE`] runs — OPNsense's write API has
+/// no discardable candidate, only a write-then-load two-step. A `POST` here
+/// can still return HTTP 200 with `{"result": "failed", "validations": {...}}`
+/// in the body; a caller must check `result`, not just the status code.
+pub const ALIASES_ADD_ITEM: &str = "/api/firewall/alias/addItem";
+
+/// Fetch one firewall alias by UUID. Module `firewall`, controller `alias`.
+///
+/// # Panics
+///
+/// Never: `uuid` must already have passed [`crate::client::validate_uuid`]
+/// before this is called, since it is interpolated into the path.
+#[must_use]
+pub fn aliases_get_item(uuid: &str) -> String {
+    format!("/api/firewall/alias/getItem/{uuid}")
+}
+
+/// Update a firewall alias by UUID. Module `firewall`, controller `alias`.
+///
+/// Same immediate-persist-but-not-loaded semantics as [`ALIASES_ADD_ITEM`].
+#[must_use]
+pub fn aliases_set_item(uuid: &str) -> String {
+    format!("/api/firewall/alias/setItem/{uuid}")
+}
+
+/// Delete a firewall alias by UUID. Module `firewall`, controller `alias`.
+#[must_use]
+pub fn aliases_del_item(uuid: &str) -> String {
+    format!("/api/firewall/alias/delItem/{uuid}")
+}
+
+/// Load staged alias definitions from `config.xml` into the live `pf` alias
+/// tables. Module `firewall`, controller `alias`.
+///
+/// This is the closest thing OPNsense's alias API has to a commit: nothing
+/// written by [`ALIASES_ADD_ITEM`], [`aliases_set_item`], or
+/// [`aliases_del_item`] is live until this runs.
+pub const ALIASES_RECONFIGURE: &str = "/api/firewall/alias/reconfigure";
+
 /// Outbound NAT rules, paginated search. Module `firewall`, controller `source_nat`.
 pub const NAT_OUTBOUND_SEARCH: &str = "/api/firewall/source_nat/search_rule";
 

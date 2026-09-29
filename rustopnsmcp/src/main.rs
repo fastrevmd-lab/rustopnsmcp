@@ -96,8 +96,30 @@ async fn main() -> Result<()> {
 
     let audit_sink = init_audit(&cli.common)?;
 
+    if cli.lab_mode() {
+        tracing::warn!(
+            target: "audit",
+            "lab mode is enabled: change sets may be approved by their own creator, \
+             recorded as a waiver rather than a genuine two-person approval"
+        );
+    }
+    if cli.state_file.is_none() {
+        tracing::warn!(
+            target: "audit",
+            "no --state-file configured: change sets, approvals, and previews are kept \
+             in memory only and are lost on restart"
+        );
+    }
+
+    let coordinator = rustopnsmcp::changeset_state::build_coordinator(
+        cli.state_file.as_deref(),
+        std::time::Duration::from_secs(cli.approval_timeout_secs),
+        cli.lab_mode(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+
     let registry = Arc::new(DeviceRegistry::load(&cli.common.device_mapping)?);
-    let server = OpnsenseServer::new(Arc::clone(&registry))?;
+    let server = OpnsenseServer::new(Arc::clone(&registry), cli.lab_mode(), coordinator)?;
 
     match cli.common.transport {
         mecmcp_runtime::cli::Transport::Stdio => {

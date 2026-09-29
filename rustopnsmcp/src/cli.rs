@@ -4,11 +4,12 @@
 //! shared flag — transport, bind, TLS, allowed hosts, audit, and the `token`
 //! subcommand — behaves exactly as it does on the sibling servers.
 //!
-//! Phase 1 has no change-set lifecycle, so this carries none of the
-//! `--lab-mode` / `--state-file` / `--approval-timeout-secs` flags those
-//! servers add: there is nothing here for them to configure yet.
+//! Phase 2a adds the change-set lifecycle for firewall aliases, so this now
+//! carries `--lab-mode` / `--state-file` / `--approval-timeout-secs`, spelled
+//! identically to every other mecmcp server.
 
 use clap::Parser;
+use std::path::PathBuf;
 
 /// `rustopnsmcp` command line.
 #[derive(Debug, Parser)]
@@ -17,6 +18,37 @@ pub struct OpnsCli {
     /// Flags shared with the rest of the mechub MCP family.
     #[command(flatten)]
     pub common: mecmcp_runtime::cli::Cli,
+
+    /// Run without two-person control for change-set approval.
+    ///
+    /// For a single-operator lab. No approver is invented: a waived change
+    /// set records `approver: null` with a lab-mode waiver, so it stays
+    /// distinguishable from one a second person reviewed.
+    ///
+    /// Spelled identically on every mecmcp server.
+    #[arg(long = "lab-mode")]
+    pub lab_mode: bool,
+
+    /// Absolute path to the change-set and operation state file.
+    ///
+    /// Spelled `--state-file` on every mecmcp server. **Without it the
+    /// coordinator keeps change sets in memory only**: every approval,
+    /// preview, and in-flight apply is lost on restart.
+    #[arg(long = "state-file")]
+    pub state_file: Option<PathBuf>,
+
+    /// How long a change set stays usable, in seconds.
+    ///
+    /// Spelled `--approval-timeout-secs` on every mecmcp server, and it
+    /// configures the change-set coordinator's approval TTL — which is what
+    /// actually expires an approval, rather than a window this server
+    /// measured itself.
+    ///
+    /// The window runs from the moment something is **staged**, not from
+    /// approval, and it bounds the age of the pre-image the plan was built
+    /// against.
+    #[arg(long = "approval-timeout-secs", default_value = "300")]
+    pub approval_timeout_secs: u64,
 
     /// Expose the `/metrics` (Prometheus) endpoint (streamable-http only).
     /// OFF by default: `/metrics` carries no MCP bearer auth of its own, so
@@ -31,6 +63,14 @@ pub struct OpnsCli {
     /// flags passed behaves exactly as before.
     #[command(flatten)]
     pub limits: LimitsArgs,
+}
+
+impl OpnsCli {
+    /// Whether lab mode is enabled.
+    #[must_use]
+    pub fn lab_mode(&self) -> bool {
+        self.lab_mode
+    }
 }
 
 /// CLI-configurable mirror of `mecmcp_transport::LimitsConfig`.
@@ -186,6 +226,32 @@ mod tests {
 
         let cli = OpnsCli::try_parse_from(["rustopnsmcp", "--enable-metrics"]).expect("parses");
         assert!(cli.enable_metrics);
+    }
+
+    #[test]
+    fn lab_mode_and_state_file_default_off_but_operator_configurable() {
+        let cli = OpnsCli::try_parse_from(["rustopnsmcp"]).expect("parses");
+        assert!(!cli.lab_mode());
+        assert!(cli.state_file.is_none());
+        assert_eq!(cli.approval_timeout_secs, 300);
+
+        let cli = OpnsCli::try_parse_from([
+            "rustopnsmcp",
+            "--lab-mode",
+            "--state-file",
+            "/var/lib/rustopnsmcp/changesets.json",
+            "--approval-timeout-secs",
+            "600",
+        ])
+        .expect("parses");
+        assert!(cli.lab_mode());
+        assert_eq!(
+            cli.state_file,
+            Some(std::path::PathBuf::from(
+                "/var/lib/rustopnsmcp/changesets.json"
+            ))
+        );
+        assert_eq!(cli.approval_timeout_secs, 600);
     }
 
     /// The shared `token` subcommand must remain reachable through the
