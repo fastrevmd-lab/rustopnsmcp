@@ -257,7 +257,7 @@ impl OpnsenseServer {
             .map_err(|error| Box::new(tool_error(format!("failed to compute diff: {error}"))))?;
         let atomicity = OpnsenseTransaction::atomicity();
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        let mut rendered = serde_json::json!({
             "device": device,
             "description": description,
             "staged_count": mutations.len(),
@@ -267,11 +267,27 @@ impl OpnsenseServer {
                 "guaranteed_rollback": atomicity.guaranteed_rollback,
                 "note": "OPNsense writes each alias to config.xml immediately and only \
                          loads it into the live pf tables on reconfigure: a partial apply \
-                         is reachable and rollback is best-effort",
+                         is reachable and rollback is best-effort. reconfigure loads every \
+                         pending alias edit currently in config.xml into the live pf \
+                         tables, not only this change set's mutations — including any \
+                         unapproved edit made through the OPNsense GUI since this change \
+                         set was staged. Reconciling a create whose response was lost to a \
+                         transport failure searches for an alias by name; a concurrent GUI \
+                         create of that same name can be mistaken for this change set's own \
+                         write and later deleted on rollback.",
             },
             "changes": diff.changes,
-        }))
-        .map_err(|error| Box::new(tool_error(format!("failed to render the preview: {error}"))))
+        });
+
+        // The description is free text a caller supplied, and the preview is
+        // both returned to callers and persisted in the change-set store:
+        // this is the one place a secret-shaped value in it is scrubbed
+        // before either happens, mirroring what `Self::respond` already does
+        // for every read tool.
+        mecmcp_redact::redact_json_value(&mut rendered);
+
+        serde_json::to_string_pretty(&rendered)
+            .map_err(|error| Box::new(tool_error(format!("failed to render the preview: {error}"))))
     }
 
     /// The description carried in a record's preview.
@@ -966,11 +982,12 @@ impl OpnsenseServer {
             Err(e) => return tool_error(format!("failed to compute diff: {e}")),
         };
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "change_set_id": record.id,
             "computed": diff.computed,
             "changes": diff.changes,
         });
+        mecmcp_redact::redact_json_value(&mut result);
 
         tool_result(
             Ok::<_, String>(result),
@@ -1134,7 +1151,7 @@ impl OpnsenseServer {
             }
         };
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "change_set_id": outcome.change_set_id,
             "state": outcome.state.as_str(),
             "approved_by": outcome.approver,
@@ -1143,6 +1160,11 @@ impl OpnsenseServer {
             "approved_digest": outcome.digest,
             "preview": preview.artifact,
         });
+        // `preview.artifact` was already redacted when `render_preview` built
+        // it, but redacting again here is what keeps this call site correct
+        // on its own rather than relying on staging-time behavior a future
+        // change could quietly break.
+        mecmcp_redact::redact_json_value(&mut result);
 
         tool_result(
             Ok::<_, String>(result),
@@ -1343,17 +1365,19 @@ impl OpnsenseServer {
         }
 
         if let Some(draft) = self.draft(&args.change_set_id, &args.device) {
+            let mut result = serde_json::json!({
+                "change_set_id": args.change_set_id,
+                "device": draft.device,
+                "description": draft.description,
+                "creator": draft.owner,
+                "state": "draft",
+                "mutation_count": 0,
+                "note": "nothing is staged yet; this draft is held in memory and is \
+                         lost on restart",
+            });
+            mecmcp_redact::redact_json_value(&mut result);
             return tool_result(
-                Ok::<_, String>(serde_json::json!({
-                    "change_set_id": args.change_set_id,
-                    "device": draft.device,
-                    "description": draft.description,
-                    "creator": draft.owner,
-                    "state": "draft",
-                    "mutation_count": 0,
-                    "note": "nothing is staged yet; this draft is held in memory and is \
-                             lost on restart",
-                })),
+                Ok::<_, String>(result),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
             );
@@ -1380,7 +1404,7 @@ impl OpnsenseServer {
 
         let description = Self::description_of(&record).unwrap_or_default();
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "change_set_id": record.id,
             "device": record.device,
             "description": description,
@@ -1398,6 +1422,7 @@ impl OpnsenseServer {
             "expected_preimage_fingerprint": record.expected_candidate_fingerprint,
             "preview": record.preview.as_ref().map(|preview| preview.artifact.clone()),
         });
+        mecmcp_redact::redact_json_value(&mut result);
 
         tool_result(
             Ok::<_, String>(result),
@@ -1510,6 +1535,33 @@ mod tests {
             OpnsenseServer::approver_actor_type(None),
             mecmcp_audit::ActorType::Unknown
         );
+    }
+
+    /// The preview is built from a caller-supplied `description`, then both
+    /// returned from `opnsense_diff_change_set`/`opnsense_approve_change_set`/
+    /// `opnsense_get_change_set` and persisted in the change-set store.
+    /// Before this fix, none of those paths ran the redaction every read
+    /// tool already gets via `Self::respond`, so a secret-shaped string in
+    /// the description reached both the caller and the on-disk state file
+    /// verbatim.
+    #[test]
+    fn render_preview_redacts_secret_shaped_text_in_the_description() {
+        let preimage = Preimage::from_resources(Vec::new());
+        let mutations = vec![StagedMutation::create(serde_json::json!({
+            "name": "test_alias",
+            "type": "host",
+        }))];
+
+        let artifact = OpnsenseServer::render_preview(
+            "home",
+            "rollout notes: password=hunter2",
+            &mutations,
+            &preimage,
+        )
+        .expect("renders");
+
+        assert!(!artifact.contains("hunter2"), "{artifact}");
+        assert!(artifact.contains("REDACTED"), "{artifact}");
     }
 
     fn coordinator_at(path: Option<&std::path::Path>) -> Arc<ChangesetCoordinator> {

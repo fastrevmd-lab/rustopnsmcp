@@ -390,6 +390,19 @@ pub fn validate_uuid(uuid: &str) -> Result<(), OpnsenseError> {
     }
 }
 
+/// Build the body `rollback_mutation` sends to restore an update's or
+/// delete's pre-image state.
+///
+/// `prior` is `getItem` shape (option fields as `{value, selected}` maps);
+/// `setItem`/`addItem` require the flat shape. Replaying `prior` verbatim
+/// either gets refused as malformed or silently drops a field. Pulled out as
+/// its own function, rather than inlining `flatten_for_write(prior)` at each
+/// call site, so the exact value the wire call receives is directly
+/// testable without a live device.
+fn rollback_body(prior: &serde_json::Value) -> serde_json::Value {
+    crate::changeset::flatten_for_write(prior)
+}
+
 impl crate::changeset::ControllerOps for OpnsenseClient {
     async fn apply_mutation(
         &self,
@@ -416,7 +429,7 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
         prior_value: Option<&serde_json::Value>,
         created_uuid: Option<&str>,
     ) -> Result<(), OpnsenseError> {
-        use crate::changeset::{StagedMutation, flatten_for_write};
+        use crate::changeset::StagedMutation;
 
         match mutation {
             StagedMutation::Create { .. } => {
@@ -429,21 +442,16 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback update {uuid}: no prior value"))
                 })?;
-                // `prior` is `getItem` shape (option fields as `{value,
-                // selected}` maps); `setItem` requires the flat shape.
-                // Replaying it verbatim either gets refused as malformed or
-                // silently drops a field.
-                self.set_alias(uuid, &flatten_for_write(prior)).await
+                self.set_alias(uuid, &rollback_body(prior)).await
             }
             StagedMutation::Delete { uuid } => {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback delete {uuid}: no prior value"))
                 })?;
-                // Flattened for the same reason as the update arm above.
                 // `uuid` is not in `WRITABLE_FIELDS`, so flattening also
                 // drops the bookkeeping key `get_alias_item` inserted; the
                 // device assigns a fresh one on re-create.
-                self.add_alias(&flatten_for_write(prior)).await.map(|_| ())
+                self.add_alias(&rollback_body(prior)).await.map(|_| ())
             }
         }
     }
@@ -666,6 +674,30 @@ mod tests {
         assert!(body.get("username").is_none());
         assert!(body.get("password").is_none());
         assert_eq!(body.get("name"), Some(&serde_json::json!("blocklist")));
+    }
+
+    /// `rollback_mutation`'s update and delete arms both send this value to
+    /// `setItem`/`addItem`. Without this test, nothing in the suite ever
+    /// checks that the flattened shape rollback actually needs is what
+    /// reaches the wire, only that `flatten_for_write` behaves correctly in
+    /// isolation.
+    #[test]
+    fn rollback_body_is_the_flattened_prior_value() {
+        let prior = serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "name": "web_servers",
+            "type": {
+                "host": {"value": "Host(s)", "selected": 1},
+                "network": {"value": "Network(s)", "selected": 0},
+            },
+        });
+
+        let body = super::rollback_body(&prior);
+
+        assert_eq!(body.get("name"), Some(&serde_json::json!("web_servers")));
+        assert_eq!(body.get("type"), Some(&serde_json::json!("host")));
+        // The read-only uuid must not be replayed as a write field.
+        assert!(body.get("uuid").is_none());
     }
 
     /// A missing `status` field must not be read as success — only an

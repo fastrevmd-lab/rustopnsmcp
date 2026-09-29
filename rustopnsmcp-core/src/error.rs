@@ -75,17 +75,24 @@ impl OpnsenseError {
     /// before it) can leave an orphaned write neither reported nor undone.
     /// `Connect`, `QueueFull`, and `LimiterClosed` are excluded: the request
     /// never left this process, so the device cannot have acted on it.
+    ///
+    /// A `502`/`503`/`504` from `Upstream` is included too: those are the
+    /// status codes a reverse proxy in front of the device emits on its own
+    /// account, so — unlike a device-authored non-2xx response — they say
+    /// nothing about whether the request they wrap ever reached the OPNsense
+    /// process behind it.
     #[must_use]
     pub fn is_indeterminate(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Http(
                 mecmcp_http::HttpError::Timeout { .. }
-                    | mecmcp_http::HttpError::RequestFailed { .. }
-                    | mecmcp_http::HttpError::BodyRead { .. }
-                    | mecmcp_http::HttpError::ResponseTooLarge { .. }
-            )
-        )
+                | mecmcp_http::HttpError::RequestFailed { .. }
+                | mecmcp_http::HttpError::BodyRead { .. }
+                | mecmcp_http::HttpError::ResponseTooLarge { .. },
+            ) => true,
+            Self::Upstream { status, .. } => matches!(status, 502..=504),
+            _ => false,
+        }
     }
 }
 
@@ -278,6 +285,29 @@ mod tests {
             },
         ];
         for error in definite {
+            assert!(!error.is_indeterminate(), "{error}");
+        }
+    }
+
+    /// A reverse proxy in front of the device answering `502`/`503`/`504`
+    /// says nothing about whether the OPNsense process behind it ever saw
+    /// the request — unlike a device-authored `500`, which means the device
+    /// itself processed the request and failed.
+    #[test]
+    fn upstream_502_503_504_are_indeterminate_but_other_statuses_are_not() {
+        for status in [502, 503, 504] {
+            let error = OpnsenseError::Upstream {
+                status,
+                detail: "bad gateway".to_owned(),
+            };
+            assert!(error.is_indeterminate(), "{error}");
+        }
+
+        for status in [400, 404, 500] {
+            let error = OpnsenseError::Upstream {
+                status,
+                detail: "device error".to_owned(),
+            };
             assert!(!error.is_indeterminate(), "{error}");
         }
     }

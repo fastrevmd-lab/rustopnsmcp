@@ -28,8 +28,18 @@ pub(crate) const WRITABLE_FIELDS: &[&str] = &[
     "categories",
 ];
 
+/// Alias types this phase refuses to stage.
+///
+/// A `url`/`urltable` alias makes OPNsense itself fetch a remote list on
+/// `reconfigure` and periodically thereafter — an outbound request the
+/// device makes because a model chose this type, not because a human
+/// approved a specific URL. Refusing the type at staging time keeps that
+/// decision out of the model's hands entirely, consistent with every other
+/// resource kind this phase does not govern.
+const REFUSED_ALIAS_TYPES: &[&str] = &["url", "urltable"];
+
 /// Refuse a staged mutation whose body sets a field outside the writable
-/// set, or a create missing `name` or `type`.
+/// set, sets a refused alias type, or a create missing `name` or `type`.
 ///
 /// Runs on the mutation list alone — no pre-image or device round trip
 /// needed — so it can run at staging time, before a bad mutation ever enters
@@ -37,8 +47,8 @@ pub(crate) const WRITABLE_FIELDS: &[&str] = &[
 ///
 /// # Errors
 ///
-/// Returns [`OpnsenseError::WriteRefused`] naming the mutation and the field
-/// or omission that was refused.
+/// Returns [`OpnsenseError::WriteRefused`] naming the mutation and the field,
+/// type, or omission that was refused.
 pub fn check_writable_fields(mutations: &[StagedMutation]) -> Result<(), OpnsenseError> {
     for mutation in mutations {
         let body = match mutation {
@@ -63,6 +73,17 @@ pub fn check_writable_fields(mutations: &[StagedMutation]) -> Result<(), Opnsens
                     WRITABLE_FIELDS.join(", ")
                 )));
             }
+        }
+
+        if let Some(alias_type) = object.get("type").and_then(serde_json::Value::as_str)
+            && REFUSED_ALIAS_TYPES.contains(&alias_type)
+        {
+            return Err(OpnsenseError::WriteRefused(format!(
+                "staged {} sets type '{alias_type}', which this server refuses to write: it \
+                 makes the device itself fetch a remote URL on reconfigure, an outbound \
+                 request this phase does not let a model trigger",
+                mutation.preview()
+            )));
         }
 
         if matches!(mutation, StagedMutation::Create { .. }) {
@@ -222,6 +243,27 @@ mod tests {
     fn a_delete_needs_no_body_check() {
         let mutations = vec![StagedMutation::delete("u1")];
         assert!(check_writable_fields(&mutations).is_ok());
+    }
+
+    /// A `url`/`urltable` alias makes the device itself fetch a remote URL on
+    /// `reconfigure`. This phase must refuse both a create and an update that
+    /// set that type, not only rely on a human catching it in review.
+    #[test]
+    fn a_url_type_create_is_refused() {
+        let mutations = vec![StagedMutation::create(json!({
+            "name": "blocklist",
+            "type": "urltable",
+            "content": "https://example.org/list.txt"
+        }))];
+        let error = check_writable_fields(&mutations).expect_err("urltable must be refused");
+        assert!(error.to_string().contains("urltable"), "{error}");
+    }
+
+    #[test]
+    fn a_url_type_update_is_refused() {
+        let mutations = vec![StagedMutation::update("u1", json!({"type": "url"}))];
+        let error = check_writable_fields(&mutations).expect_err("url must be refused");
+        assert!(error.to_string().contains("'url'"), "{error}");
     }
 
     #[test]
