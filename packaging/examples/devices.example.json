@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "devices": {
+    "fw-1": {
+      "endpoint": "https://fw-1.example.org",
+      "api_key_env": "OPNSENSE_FW_1_API_KEY",
+      "api_secret_env": "OPNSENSE_FW_1_API_SECRET",
+      "ca_pem_path": "/etc/rustopnsmcp/fw-1-ca.pem"
+    }
+  }
+}

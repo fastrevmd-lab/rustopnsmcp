@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build, lint, and test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked
+
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Check workspace at MSRV
+        run: |
+          rustc --version
+          cargo check --workspace --all-targets --locked
+
+  supply-chain:
+    name: Supply-chain policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: Check RustSec advisories
+        run: cargo audit --deny warnings
+
+      - name: Check licenses, bans, and sources
+        run: cargo deny check licenses bans sources
+
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  container-guard:
+    name: Container argv guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build and verify container argv
+        run: |
+          docker build -t rustopnsmcp:ci .
+
+          # Config paths must survive operator overrides. Docker replaces CMD
+          # entirely when the caller supplies args, but appends to ENTRYPOINT,
+          # so security-relevant flags must live in ENTRYPOINT or they vanish
+          # the moment anyone passes --host.
+          container_id=$(docker create rustopnsmcp:ci --host 0.0.0.0)
+          argv=$(docker inspect "$container_id" --format '{{join .Args "\n"}}')
+          docker rm "$container_id" > /dev/null
+
+          for p in /etc/rustopnsmcp/devices.json /var/lib/rustopnsmcp/tokens.json; do
+            echo "$argv" | grep -q -- "$p" || { echo "FAIL: $p missing from argv with --host override"; exit 1; }
+          done
+          echo "PASS: config paths survive --host override"

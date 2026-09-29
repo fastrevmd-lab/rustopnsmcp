@@ -1,0 +1,25 @@
+# Allow-list, not deny-list: exclude everything, then re-include exactly
+# what the Dockerfile copies. A deny-list grows a hole every time a new
+# local file appears; this does not.
+
+*
+
+# What the build actually needs
+!Cargo.toml
+!Cargo.lock
+!rustopnsmcp/
+!rustopnsmcp-core/
+
+# Re-exclude sensitive and generated paths that live *inside* those
+# directories. A later pattern wins, so these override the re-inclusions
+# above.
+**/target/
+**/tokens.json
+**/*.tokens.json
+**/devices.json
+**/*.opnsensekey
+**/.opnsensekey
+**/.opnsense-api-key
+**/.opnsense-api-secret
+**/.env
+**/.env.*

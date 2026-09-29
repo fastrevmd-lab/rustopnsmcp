@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "status_msg": "Firmware status check was performed less than an hour ago.",
+  "product": {
+    "product_version": "24.7",
+    "product_latest": "24.7",
+    "product_series": "24.7"
+  },
+  "upgrade_needs_reboot": "0"
+}

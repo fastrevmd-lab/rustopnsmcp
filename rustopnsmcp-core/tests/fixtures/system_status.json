@@ -1,0 +1,9 @@
+{
+  "product_name": "OPNsense",
+  "product_version": "24.7",
+  "device_uptime": "3 days, 04:12",
+  "date_time": "Mon Sep 28 12:00:00 UTC 2026",
+  "cpu_type": "QEMU Virtual CPU",
+  "load_average": "0.12, 0.09, 0.05",
+  "temp": null
+}

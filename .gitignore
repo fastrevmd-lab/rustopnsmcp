@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+
+# Cargo.lock IS committed — this workspace ships a binary.
+
+# Never commit real authentication material, even hashed.
+tokens.json
+*.tokens.json
+
+# Device inventory carries device names and addresses.
+devices.json
+
+.env
+.env.*
+.DS_Store
+
+# Local OPNsense API key/secret — never commit. mecmcp-secret requires mode 0600.
+.opnsensekey
+*.opnsensekey
+.opnsense-api-key
+.opnsense-api-secret

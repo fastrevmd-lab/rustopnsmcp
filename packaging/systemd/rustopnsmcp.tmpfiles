@@ -1,0 +1,2 @@
+d /etc/opnsmcp 0750 root opnsmcp -
+d /var/lib/opnsmcp 0700 opnsmcp opnsmcp -
