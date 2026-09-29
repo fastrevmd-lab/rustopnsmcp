@@ -55,7 +55,7 @@ COPY --from=builder /build/target/release/rustopnsmcp /usr/local/bin/rustopnsmcp
 
 LABEL org.opencontainers.image.title="rustopnsmcp"
 LABEL org.opencontainers.image.description="OPNsense MCP server"
-LABEL org.opencontainers.image.source="https://github.com/fastrevmd-lab/rustopnsmcp"
+LABEL org.opencontainers.image.source="https://github.com/mechubsec/rustopnsmcp"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # ENTRYPOINT carries what must always hold: config paths and anything

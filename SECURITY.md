@@ -6,13 +6,13 @@ Please **do not** open a public GitHub issue for a security vulnerability.
 
 Instead, use GitHub's private vulnerability reporting for this repository:
 
-https://github.com/fastrevmd-lab/rustopnsmcp/security/advisories/new
+https://github.com/mechubsec/rustopnsmcp/security/advisories/new
 
 Include what you'd include in a bug report — affected version, reproduction steps, and impact — but keep it in the private report, not a public issue, PR, or discussion.
 
 ## Scope
 
-`rustopnsmcp` is an MCP server that authenticates to one or more OPNsense devices and exposes a curated, scoped set of tools over MCP, with authentication, transport, audit, and (from phase 2) change-control behavior supplied by the shared [`mecmcp`](https://github.com/fastrevmd-lab/mecmcp) crates. Phase 1 exposes read tools only. Vulnerability classes we especially want to hear about:
+`rustopnsmcp` is an MCP server that authenticates to one or more OPNsense devices and exposes a curated, scoped set of tools over MCP, with authentication, transport, audit, and (from phase 2) change-control behavior supplied by the shared [`mecmcp`](https://github.com/mechubsec/mecmcp) crates. Phase 1 exposes read tools only. Vulnerability classes we especially want to hear about:
 
 - Anything that lets a caller exceed the scope granted to its token without going through the intended auth/scope checks
 - TLS or certificate-handling issues in the server's listener, or in its outbound connection to an OPNsense device
