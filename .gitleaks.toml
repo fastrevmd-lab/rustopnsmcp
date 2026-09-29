@@ -1,0 +1,18 @@
+title = "rustopnsmcp gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixtures that name env vars, not secrets"
+
+# devices.example.json points operators at the env vars that hold API
+# credentials (api_key_env / api_secret_env); the values are env var
+# *names* like "OPNSENSE_FW_1_API_SECRET", not real secrets, but the
+# "SECRET" substring trips the generic-api-key rule.
+regexes = [
+  '''OPNSENSE_FW_1_API_(KEY|SECRET)''',
+]
+paths = [
+  '''packaging/examples/devices\.example\.json''',
+]

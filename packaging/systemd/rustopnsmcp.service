@@ -1,0 +1,86 @@
+[Unit]
+Description=rustopnsmcp — OPNsense MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustopnsmcp
+Group=rustopnsmcp
+ExecStart=/usr/local/bin/rustopnsmcp \
+    --device-mapping /etc/rustopnsmcp/devices.json \
+    --tokens-file /var/lib/rustopnsmcp/tokens.json \
+    --transport streamable-http \
+    --host @OPNSMCP_BIND_HOST@ --port 30037 \
+    --allowed-host @OPNSMCP_ALLOWED_HOST@ \
+    --allowed-origin @OPNSMCP_ALLOWED_ORIGIN@ \
+    --tls-cert /etc/rustopnsmcp/tls/fullchain.pem \
+    --tls-key /etc/rustopnsmcp/tls/privkey.pem \
+    --audit-format json \
+    --audit-log-file /var/lib/rustopnsmcp/audit.jsonl \
+    --audit-journald
+Restart=on-failure
+RestartSec=5
+UMask=0077
+EnvironmentFile=-/etc/rustopnsmcp/secrets.env
+
+# /etc/rustopnsmcp stays read-only to the service. This is deliberate: it is
+# what makes editing the device inventory a root operation rather than
+# something the server could be talked into — phase 1 has no write tools at
+# all, and this keeps it that way at the filesystem layer too.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+StateDirectory=rustopnsmcp
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/rustopnsmcp
+
+# Seccomp filter and syscall restrictions.
+# SystemCallErrorNumber=EPERM makes a denied syscall return an error instead
+# of raising SIGSYS and killing the process outright — a denial must be
+# something the application can see and log, not a silent crash mid-request.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @module
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# Drop all capabilities
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Additional hardening
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Network access control (allow outbound to the OPNsense device's private
+# network). NOTE: IPAddressAllow/IPAddressDeny are accepted by systemd and
+# reported by `systemctl show`, but are not enforced in an unprivileged LXC
+# guest — systemd cannot attach the cgroup BPF program there. They still
+# enforce on a normal host or privileged container; verify enforcement on
+# the actual deployment target rather than assuming it from this file.
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=link-local
+IPAddressAllow=192.168.0.0/16
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

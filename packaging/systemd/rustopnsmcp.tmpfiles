@@ -1,0 +1,2 @@
+d /etc/rustopnsmcp 0750 root rustopnsmcp -
+d /var/lib/rustopnsmcp 0700 rustopnsmcp rustopnsmcp -

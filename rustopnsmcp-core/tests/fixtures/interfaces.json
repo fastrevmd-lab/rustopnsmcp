@@ -1,0 +1,16 @@
+{
+  "rows": {
+    "wan": {
+      "device": "vtnet0",
+      "descr": "WAN",
+      "status": "up",
+      "ipv4": [{ "ipaddr": "203.0.113.10", "subnetbits": "24" }]
+    },
+    "lan": {
+      "device": "vtnet1",
+      "descr": "LAN",
+      "status": "up",
+      "ipv4": [{ "ipaddr": "198.51.100.1", "subnetbits": "24" }]
+    }
+  }
+}

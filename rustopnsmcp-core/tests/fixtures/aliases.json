@@ -1,0 +1,14 @@
+{
+  "rows": [
+    {
+      "uuid": "33333333-3333-3333-3333-333333333333",
+      "name": "rfc1918",
+      "type": "network",
+      "content": "10.0.0.0/8\n172.16.0.0/12\n192.168.0.0/16",
+      "description": "Private address space"
+    }
+  ],
+  "rowCount": 1,
+  "total": 1,
+  "current": 1
+}

@@ -1,0 +1,11 @@
+{
+  "items": [
+    {
+      "name": "WAN_DHCP",
+      "address": "203.0.113.1",
+      "status": "online",
+      "delay": "2.1 ms",
+      "loss": "0.0%"
+    }
+  ]
+}

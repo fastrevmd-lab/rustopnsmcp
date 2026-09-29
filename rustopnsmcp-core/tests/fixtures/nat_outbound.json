@@ -1,0 +1,14 @@
+{
+  "rows": [
+    {
+      "uuid": "44444444-4444-4444-4444-444444444444",
+      "interface": "wan",
+      "source_net": "lan",
+      "target": "",
+      "description": "Auto outbound NAT for LAN"
+    }
+  ],
+  "rowCount": 1,
+  "total": 1,
+  "current": 1
+}

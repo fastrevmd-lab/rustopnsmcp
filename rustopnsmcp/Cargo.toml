@@ -1,0 +1,36 @@
+[package]
+name = "rustopnsmcp"
+description = "Enterprise MCP server for OPNsense"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustopnsmcp-core.workspace = true
+mecmcp-audit.workspace = true
+mecmcp-auth.workspace = true
+mecmcp-redact.workspace = true
+mecmcp-runtime.workspace = true
+mecmcp-server.workspace = true
+mecmcp-transport.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

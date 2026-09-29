@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build, lint, and test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --locked
+
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.89.0
+
+      - name: Check workspace at MSRV
+        run: |
+          rustc --version
+          cargo check --workspace --all-targets --locked
+
+  supply-chain:
+    name: Supply-chain policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: Check RustSec advisories
+        run: cargo audit --deny warnings
+
+      - name: Check licenses, bans, and sources
+        run: cargo deny check licenses bans sources
+
+  # Secret scan: the shared mechubsec workflow (pinned gitleaks binary,
+  # sha256-verified, output redacted; no license needed unlike
+  # gitleaks-action on org repos). Matches rustunifimcp's security.yml.
+  gitleaks:
+    name: Secret scan
+    uses: mechubsec/.github/.github/workflows/gitleaks.yml@fb1a159c596bf2c57b9f6f1ff99f546463a6a84a
+
+  container-guard:
+    name: Container argv guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and verify container argv
+        run: |
+          docker build -t rustopnsmcp:ci .
+
+          # Config paths must survive operator overrides. Docker replaces CMD
+          # entirely when the caller supplies args, but appends to ENTRYPOINT,
+          # so security-relevant flags must live in ENTRYPOINT or they vanish
+          # the moment anyone passes --host.
+          container_id=$(docker create rustopnsmcp:ci --host 0.0.0.0)
+          argv=$(docker inspect "$container_id" --format '{{join .Args "\n"}}')
+          docker rm "$container_id" > /dev/null
+
+          for p in /etc/rustopnsmcp/devices.json /var/lib/rustopnsmcp/tokens.json; do
+            echo "$argv" | grep -q -- "$p" || { echo "FAIL: $p missing from argv with --host override"; exit 1; }
+          done
+          echo "PASS: config paths survive --host override"
