@@ -158,7 +158,38 @@ impl OpnsenseClient {
     pub async fn get_alias_item(&self, uuid: &str) -> Result<serde_json::Value, OpnsenseError> {
         validate_uuid(uuid)?;
         let raw = self.get(&endpoints::aliases_get_item(uuid)).await?;
-        interpret_get_item_response(raw, uuid)
+        interpret_get_item_response(raw, uuid, "alias")
+    }
+
+    /// Fetch one firewall filter rule by UUID.
+    ///
+    /// Same envelope-unwrapping and not-found translation as
+    /// [`Self::get_alias_item`], wrapped under `"rule"` per OPNsense's filter
+    /// controller convention.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_alias_item`].
+    pub async fn get_rule_item(&self, uuid: &str) -> Result<serde_json::Value, OpnsenseError> {
+        validate_uuid(uuid)?;
+        let raw = self.get(&endpoints::filter_get_rule(uuid)).await?;
+        interpret_get_item_response(raw, uuid, "rule")
+    }
+
+    /// Fetch one resource (alias or rule) by UUID, dispatching on `kind`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_alias_item`] / [`Self::get_rule_item`].
+    pub async fn get_item(
+        &self,
+        kind: crate::changeset::ResourceKind,
+        uuid: &str,
+    ) -> Result<serde_json::Value, OpnsenseError> {
+        match kind {
+            crate::changeset::ResourceKind::Alias => self.get_alias_item(uuid).await,
+            crate::changeset::ResourceKind::Rule => self.get_rule_item(uuid).await,
+        }
     }
 
     /// Search for an alias by exact name.
@@ -188,6 +219,40 @@ impl OpnsenseClient {
             .map(str::to_owned))
     }
 
+    /// Search for a filter rule by exact description.
+    ///
+    /// Same purpose as [`Self::find_alias_uuid_by_name`], for a create whose
+    /// response was lost to a transport failure. A rule's `description` is
+    /// not enforced unique by OPNsense the way an alias `name` is, so a
+    /// `Some` result here is a best-effort match, not a guarantee — a
+    /// duplicate description makes this indistinguishable from a
+    /// pre-existing rule of the same text.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::post`].
+    async fn find_rule_uuid_by_description(
+        &self,
+        description: &str,
+    ) -> Result<Option<String>, OpnsenseError> {
+        let body = serde_json::json!({
+            "current": 1,
+            "rowCount": 50,
+            "searchPhrase": description,
+        });
+        let raw = self.post(endpoints::FIREWALL_RULES_SEARCH, &body).await?;
+        let Some(rows) = raw.get("rows").and_then(serde_json::Value::as_array) else {
+            return Ok(None);
+        };
+        Ok(rows
+            .iter()
+            .find(|row| {
+                row.get("description").and_then(serde_json::Value::as_str) == Some(description)
+            })
+            .and_then(|row| row.get("uuid").and_then(serde_json::Value::as_str))
+            .map(str::to_owned))
+    }
+
     /// Create a firewall alias.
     ///
     /// Persists to `config.xml` immediately; the write is not live until
@@ -209,6 +274,25 @@ impl OpnsenseClient {
             .ok_or_else(|| OpnsenseError::Malformed("addItem response has no uuid".to_owned()))
     }
 
+    /// Create a firewall filter rule.
+    ///
+    /// Persists to `config.xml` immediately; the write is not live until
+    /// [`Self::reconfigure_filter`] runs. `body` is wrapped under `"rule"`
+    /// per OPNsense's write convention.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::add_alias`].
+    pub async fn add_rule(&self, body: &serde_json::Value) -> Result<String, OpnsenseError> {
+        let payload = serde_json::json!({ "rule": body });
+        let raw = self.post(endpoints::FILTER_ADD_RULE, &payload).await?;
+        Self::require_saved(&raw)?;
+        raw.get("uuid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| OpnsenseError::Malformed("addRule response has no uuid".to_owned()))
+    }
+
     /// Update a firewall alias by UUID.
     ///
     /// Same immediate-persist-but-not-loaded semantics as [`Self::add_alias`].
@@ -226,6 +310,26 @@ impl OpnsenseClient {
         let payload = serde_json::json!({ "alias": body });
         let raw = self
             .post(&endpoints::aliases_set_item(uuid), &payload)
+            .await?;
+        Self::require_saved(&raw)
+    }
+
+    /// Update a firewall filter rule by UUID.
+    ///
+    /// Same immediate-persist-but-not-loaded semantics as [`Self::add_rule`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_alias`].
+    pub async fn set_rule(
+        &self,
+        uuid: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), OpnsenseError> {
+        validate_uuid(uuid)?;
+        let payload = serde_json::json!({ "rule": body });
+        let raw = self
+            .post(&endpoints::filter_set_rule(uuid), &payload)
             .await?;
         Self::require_saved(&raw)
     }
@@ -254,6 +358,27 @@ impl OpnsenseClient {
         }
     }
 
+    /// Delete a firewall filter rule by UUID.
+    ///
+    /// Same idempotency as [`Self::delete_alias`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::delete_alias`].
+    pub async fn delete_rule(&self, uuid: &str) -> Result<(), OpnsenseError> {
+        validate_uuid(uuid)?;
+        let raw = self
+            .post(&endpoints::filter_del_rule(uuid), &serde_json::json!({}))
+            .await?;
+        match raw.get("result").and_then(serde_json::Value::as_str) {
+            Some("deleted" | "not found") => Ok(()),
+            _ => Err(OpnsenseError::WriteRefused(format!(
+                "device did not confirm the delete: {}",
+                crate::error::sanitize_detail(&raw.to_string())
+            ))),
+        }
+    }
+
     /// Load staged alias writes into the live `pf` alias tables.
     ///
     /// This is the closest thing to a commit OPNsense's alias API has:
@@ -267,6 +392,22 @@ impl OpnsenseClient {
     pub async fn reconfigure_aliases(&self) -> Result<(), OpnsenseError> {
         let raw = self
             .post(endpoints::ALIASES_RECONFIGURE, &serde_json::json!({}))
+            .await?;
+        interpret_reconfigure_response(&raw)
+    }
+
+    /// Load staged filter-rule writes into the live `pf` ruleset.
+    ///
+    /// This is the closest thing to a commit OPNsense's filter API has:
+    /// nothing written by [`Self::add_rule`], [`Self::set_rule`], or
+    /// [`Self::delete_rule`] takes effect until this runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reconfigure_aliases`].
+    pub async fn reconfigure_filter(&self) -> Result<(), OpnsenseError> {
+        let raw = self
+            .post(endpoints::FILTER_APPLY, &serde_json::json!({}))
             .await?;
         interpret_reconfigure_response(&raw)
     }
@@ -288,23 +429,23 @@ impl OpnsenseClient {
     }
 }
 
-/// Interpret a raw `getItem` response into the pre-image shape.
+/// Interpret a raw `getItem`/`getRule` response into the pre-image shape.
 ///
-/// OPNsense's `getItem` wraps the item's fields under a top-level `"alias"`
-/// key and does not echo the UUID back into the body, so this unwraps that
-/// envelope and inserts `uuid` itself, which is what
-/// [`crate::changeset::Preimage`] keys entries by.
+/// OPNsense's `getItem`/`getRule` wraps the item's fields under a top-level
+/// key (`envelope_key`: `"alias"` or `"rule"`) and does not echo the UUID back
+/// into the body, so this unwraps that envelope and inserts `uuid` itself,
+/// which is what [`crate::changeset::Preimage`] keys entries by.
 ///
 /// OPNsense answers an unknown UUID with HTTP 200 and a bare `[]`, not a 404
 /// status — a device response this crate's HTTP layer never turns into an
 /// error — so that shape must be translated into the same "not found" signal
-/// callers of [`crate::changeset::ControllerOps::fetch_alias`] already expect
-/// from a real 404. Without this, every delete would be misread as having
-/// left the alias in place.
+/// callers of [`crate::changeset::ControllerOps::fetch_resource`] already
+/// expect from a real 404. Without this, every delete would be misread as
+/// having left the resource in place.
 ///
 /// A URL-table alias's body can carry `username`/`password` for an
 /// authenticated fetch. Those fields are dropped here, at the one place every
-/// pre-image is built, rather than trusted to `WRITABLE_FIELDS` or the
+/// pre-image is built, rather than trusted to the writable-field set or the
 /// caller: the pre-image is echoed back in previews and persisted in the
 /// change-set store, and neither is a place for a credential to end up.
 ///
@@ -312,25 +453,26 @@ impl OpnsenseClient {
 ///
 /// Returns [`OpnsenseError::Upstream`] with `status: 404` for an empty-array
 /// response, and [`OpnsenseError::Malformed`] if the response has no
-/// `"alias"` object.
+/// `envelope_key` object.
 fn interpret_get_item_response(
     raw: serde_json::Value,
     uuid: &str,
+    envelope_key: &str,
 ) -> Result<serde_json::Value, OpnsenseError> {
     if matches!(&raw, serde_json::Value::Array(items) if items.is_empty()) {
         return Err(OpnsenseError::Upstream {
             status: 404,
-            detail: "alias not found".to_owned(),
+            detail: "not found".to_owned(),
         });
     }
 
-    let Some(alias) = raw.get("alias").filter(|value| value.is_object()) else {
-        return Err(OpnsenseError::Malformed(
-            "getItem response has no alias object".to_owned(),
-        ));
+    let Some(item) = raw.get(envelope_key).filter(|value| value.is_object()) else {
+        return Err(OpnsenseError::Malformed(format!(
+            "response has no {envelope_key} object"
+        )));
     };
 
-    let mut body = alias.clone();
+    let mut body = item.clone();
     let object = body
         .as_object_mut()
         .expect("checked is_object via filter above");
@@ -393,14 +535,17 @@ pub fn validate_uuid(uuid: &str) -> Result<(), OpnsenseError> {
 /// Build the body `rollback_mutation` sends to restore an update's or
 /// delete's pre-image state.
 ///
-/// `prior` is `getItem` shape (option fields as `{value, selected}` maps);
-/// `setItem`/`addItem` require the flat shape. Replaying `prior` verbatim
-/// either gets refused as malformed or silently drops a field. Pulled out as
-/// its own function, rather than inlining `flatten_for_write(prior)` at each
-/// call site, so the exact value the wire call receives is directly
-/// testable without a live device.
-fn rollback_body(prior: &serde_json::Value) -> serde_json::Value {
-    crate::changeset::flatten_for_write(prior)
+/// `prior` is `getItem`/`getRule` shape (option fields as `{value, selected}`
+/// maps); `setItem`/`addItem`/`setRule`/`addRule` require the flat shape.
+/// Replaying `prior` verbatim either gets refused as malformed or silently
+/// drops a field. Pulled out as its own function, rather than inlining
+/// `flatten_for_write(kind, prior)` at each call site, so the exact value the
+/// wire call receives is directly testable without a live device.
+fn rollback_body(
+    kind: crate::changeset::ResourceKind,
+    prior: &serde_json::Value,
+) -> serde_json::Value {
+    crate::changeset::flatten_for_write(kind, prior)
 }
 
 impl crate::changeset::ControllerOps for OpnsenseClient {
@@ -408,16 +553,45 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
         &self,
         mutation: &crate::changeset::StagedMutation,
     ) -> Result<Option<String>, OpnsenseError> {
-        use crate::changeset::StagedMutation;
+        use crate::changeset::{ResourceKind, StagedMutation};
 
         match mutation {
-            StagedMutation::Create { body } => self.add_alias(body).await.map(Some),
-            StagedMutation::Update { uuid, body } => {
+            StagedMutation::Create {
+                kind: ResourceKind::Alias,
+                body,
+            } => self.add_alias(body).await.map(Some),
+            StagedMutation::Create {
+                kind: ResourceKind::Rule,
+                body,
+            } => self.add_rule(body).await.map(Some),
+            StagedMutation::Update {
+                kind: ResourceKind::Alias,
+                uuid,
+                body,
+            } => {
                 self.set_alias(uuid, body).await?;
                 Ok(None)
             }
-            StagedMutation::Delete { uuid } => {
+            StagedMutation::Update {
+                kind: ResourceKind::Rule,
+                uuid,
+                body,
+            } => {
+                self.set_rule(uuid, body).await?;
+                Ok(None)
+            }
+            StagedMutation::Delete {
+                kind: ResourceKind::Alias,
+                uuid,
+            } => {
                 self.delete_alias(uuid).await?;
+                Ok(None)
+            }
+            StagedMutation::Delete {
+                kind: ResourceKind::Rule,
+                uuid,
+            } => {
+                self.delete_rule(uuid).await?;
                 Ok(None)
             }
         }
@@ -429,22 +603,30 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
         prior_value: Option<&serde_json::Value>,
         created_uuid: Option<&str>,
     ) -> Result<(), OpnsenseError> {
-        use crate::changeset::StagedMutation;
+        use crate::changeset::{ResourceKind, StagedMutation};
+
+        let kind = mutation.kind();
 
         match mutation {
             StagedMutation::Create { .. } => {
                 let uuid = created_uuid.ok_or_else(|| {
                     OpnsenseError::Malformed("rollback create: no created uuid provided".to_owned())
                 })?;
-                self.delete_alias(uuid).await
+                match kind {
+                    ResourceKind::Alias => self.delete_alias(uuid).await,
+                    ResourceKind::Rule => self.delete_rule(uuid).await,
+                }
             }
             StagedMutation::Update { uuid, .. } => {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback update {uuid}: no prior value"))
                 })?;
-                self.set_alias(uuid, &rollback_body(prior)).await
+                match kind {
+                    ResourceKind::Alias => self.set_alias(uuid, &rollback_body(kind, prior)).await,
+                    ResourceKind::Rule => self.set_rule(uuid, &rollback_body(kind, prior)).await,
+                }
             }
-            StagedMutation::Delete { uuid } => {
+            StagedMutation::Delete { uuid, .. } => {
                 let prior = prior_value.ok_or_else(|| {
                     OpnsenseError::Malformed(format!("rollback delete {uuid}: no prior value"))
                 })?;
@@ -452,18 +634,26 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
                 // delete as `NotApplied` or errored outright — either of
                 // which can be wrong, the same way an update's `NotApplied`
                 // read can be wrong (see `flatten_for_write`'s field-order
-                // sensitivity). If the alias is still there under this same
-                // uuid, the delete never landed and there is nothing to
+                // sensitivity). If the resource is still there under this
+                // same uuid, the delete never landed and there is nothing to
                 // restore; re-creating it anyway would leave a duplicate
                 // under a fresh uuid rather than the idempotent no-op this
                 // rollback is supposed to be.
-                if self.fetch_alias(uuid).await?.is_some() {
+                if self.fetch_resource(kind, uuid).await?.is_some() {
                     return Ok(());
                 }
-                // `uuid` is not in `WRITABLE_FIELDS`, so flattening also
-                // drops the bookkeeping key `get_alias_item` inserted; the
+                // `uuid` is not in the writable field set, so flattening
+                // also drops the bookkeeping key `get_item` inserted; the
                 // device assigns a fresh one on re-create.
-                self.add_alias(&rollback_body(prior)).await.map(|_| ())
+                match kind {
+                    ResourceKind::Alias => self
+                        .add_alias(&rollback_body(kind, prior))
+                        .await
+                        .map(|_| ()),
+                    ResourceKind::Rule => {
+                        self.add_rule(&rollback_body(kind, prior)).await.map(|_| ())
+                    }
+                }
             }
         }
     }
@@ -482,7 +672,7 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
                 return Ok(false);
             };
 
-            let current = self.fetch_alias(uuid).await?;
+            let current = self.fetch_resource(mutation.kind(), uuid).await?;
             match current {
                 Some(live) if live == recorded => {}
                 _ => return Ok(false),
@@ -491,39 +681,56 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
         Ok(true)
     }
 
-    async fn fetch_alias(&self, uuid: &str) -> Result<Option<serde_json::Value>, OpnsenseError> {
-        match self.get_alias_item(uuid).await {
+    async fn fetch_resource(
+        &self,
+        kind: crate::changeset::ResourceKind,
+        uuid: &str,
+    ) -> Result<Option<serde_json::Value>, OpnsenseError> {
+        match self.get_item(kind, uuid).await {
             Ok(body) => Ok(Some(body)),
             Err(OpnsenseError::Upstream { status: 404, .. }) => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    async fn reconfigure(&self) -> Result<(), OpnsenseError> {
-        self.reconfigure_aliases().await
+    async fn reconfigure(&self, kind: crate::changeset::ResourceKind) -> Result<(), OpnsenseError> {
+        match kind {
+            crate::changeset::ResourceKind::Alias => self.reconfigure_aliases().await,
+            crate::changeset::ResourceKind::Rule => self.reconfigure_filter().await,
+        }
     }
 
     async fn reconcile_indeterminate(
         &self,
         mutation: &crate::changeset::StagedMutation,
     ) -> Result<crate::changeset::Reconciled, OpnsenseError> {
-        use crate::changeset::{Reconciled, StagedMutation, flatten_for_write};
+        use crate::changeset::{Reconciled, ResourceKind, StagedMutation, flatten_for_write};
+
+        let kind = mutation.kind();
 
         match mutation {
-            StagedMutation::Create { body } => {
-                let Some(name) = body.get("name").and_then(serde_json::Value::as_str) else {
+            StagedMutation::Create { body, .. } => {
+                let key = match kind {
+                    ResourceKind::Alias => "name",
+                    ResourceKind::Rule => "description",
+                };
+                let Some(value) = body.get(key).and_then(serde_json::Value::as_str) else {
                     return Ok(Reconciled::NotApplied);
                 };
-                Ok(match self.find_alias_uuid_by_name(name).await? {
+                let found = match kind {
+                    ResourceKind::Alias => self.find_alias_uuid_by_name(value).await?,
+                    ResourceKind::Rule => self.find_rule_uuid_by_description(value).await?,
+                };
+                Ok(match found {
                     Some(uuid) => Reconciled::Applied(Some(uuid)),
                     None => Reconciled::NotApplied,
                 })
             }
-            StagedMutation::Update { uuid, body } => {
-                let Some(current) = self.fetch_alias(uuid).await? else {
+            StagedMutation::Update { uuid, body, .. } => {
+                let Some(current) = self.fetch_resource(kind, uuid).await? else {
                     return Ok(Reconciled::NotApplied);
                 };
-                let flattened = flatten_for_write(&current);
+                let flattened = flatten_for_write(kind, &current);
                 let landed = body.as_object().is_some_and(|fields| {
                     fields
                         .iter()
@@ -535,10 +742,12 @@ impl crate::changeset::ControllerOps for OpnsenseClient {
                     Reconciled::NotApplied
                 })
             }
-            StagedMutation::Delete { uuid } => Ok(match self.fetch_alias(uuid).await? {
-                None => Reconciled::Applied(None),
-                Some(_) => Reconciled::NotApplied,
-            }),
+            StagedMutation::Delete { uuid, .. } => {
+                Ok(match self.fetch_resource(kind, uuid).await? {
+                    None => Reconciled::Applied(None),
+                    Some(_) => Reconciled::NotApplied,
+                })
+            }
         }
     }
 }
@@ -639,7 +848,8 @@ mod tests {
     #[test]
     fn get_item_interprets_an_empty_array_as_not_found() {
         let raw = serde_json::json!([]);
-        let error = super::interpret_get_item_response(raw, "u1").expect_err("must be refused");
+        let error =
+            super::interpret_get_item_response(raw, "u1", "alias").expect_err("must be refused");
         assert!(
             matches!(
                 error,
@@ -655,7 +865,7 @@ mod tests {
     #[test]
     fn get_item_rejects_a_response_with_no_alias_object() {
         let raw = serde_json::json!({"unrelated": true});
-        assert!(super::interpret_get_item_response(raw, "u1").is_err());
+        assert!(super::interpret_get_item_response(raw, "u1", "alias").is_err());
     }
 
     /// A well-formed response is unwrapped from its `"alias"` envelope and
@@ -663,7 +873,7 @@ mod tests {
     #[test]
     fn get_item_unwraps_the_alias_envelope_and_inserts_the_uuid() {
         let raw = serde_json::json!({"alias": {"name": "web_servers"}});
-        let body = super::interpret_get_item_response(raw, "u1").expect("parses");
+        let body = super::interpret_get_item_response(raw, "u1", "alias").expect("parses");
         assert_eq!(body.get("name"), Some(&serde_json::json!("web_servers")));
         assert_eq!(body.get("uuid"), Some(&serde_json::json!("u1")));
     }
@@ -682,10 +892,25 @@ mod tests {
                 "password": "hunter2",
             }
         });
-        let body = super::interpret_get_item_response(raw, "u1").expect("parses");
+        let body = super::interpret_get_item_response(raw, "u1", "alias").expect("parses");
         assert!(body.get("username").is_none());
         assert!(body.get("password").is_none());
         assert_eq!(body.get("name"), Some(&serde_json::json!("blocklist")));
+    }
+
+    /// `getRule` wraps under `"rule"`, not `"alias"` — the envelope key must
+    /// actually be respected, not hardcoded from the alias path this function
+    /// started as.
+    #[test]
+    fn get_item_unwraps_the_rule_envelope() {
+        let raw =
+            serde_json::json!({"rule": {"description": "Allow LAN to any", "action": "pass"}});
+        let body = super::interpret_get_item_response(raw, "u1", "rule").expect("parses");
+        assert_eq!(
+            body.get("description"),
+            Some(&serde_json::json!("Allow LAN to any"))
+        );
+        assert_eq!(body.get("uuid"), Some(&serde_json::json!("u1")));
     }
 
     /// `rollback_mutation`'s update and delete arms both send this value to
@@ -704,7 +929,7 @@ mod tests {
             },
         });
 
-        let body = super::rollback_body(&prior);
+        let body = super::rollback_body(crate::changeset::ResourceKind::Alias, &prior);
 
         assert_eq!(body.get("name"), Some(&serde_json::json!("web_servers")));
         assert_eq!(body.get("type"), Some(&serde_json::json!("host")));

@@ -2,21 +2,26 @@
 //!
 //! `rollback_mutation`'s `Delete` arm runs whenever an indeterminate delete's
 //! reconciliation read `NotApplied` or errored outright — either of which can
-//! be wrong. Before this fix it unconditionally re-created the alias from the
-//! pre-image via `addItem`. If the delete had in fact landed, that recreated
-//! an alias `apply_sequentially` believed it had removed; if the delete had
-//! *not* landed (the alias is still there under its original uuid), a
-//! `setItem`-style re-create is not idempotent the way an update's rollback
-//! is — OPNsense either rejects a duplicate name or, for firewall rules in a
-//! later phase with no name uniqueness, would create a live duplicate.
+//! be wrong. Before this fix it unconditionally re-created the resource from
+//! the pre-image via `addItem`/`addRule`. If the delete had in fact landed,
+//! that recreated a resource `apply_sequentially` believed it had removed; if
+//! the delete had *not* landed (the resource is still there under its
+//! original uuid), a `setItem`/`setRule`-style re-create is not idempotent
+//! the way an update's rollback is — OPNsense either rejects a duplicate
+//! alias name or, for firewall rules, which have no name uniqueness, would
+//! create a live duplicate rule.
 //!
 //! This drives the real [`OpnsenseClient`] (not the `apply.rs` mock) against
 //! a local TLS fixture server, the same harness `read_tools.rs` uses. The
-//! `addItem` route is deliberately left unregistered: if the fix regresses
-//! and rollback re-creates the alias anyway, that request has nowhere to
-//! land and the call errors instead of silently passing.
+//! `addItem`/`addRule` route is deliberately left unregistered in the
+//! still-exists cases: if the fix regresses and rollback re-creates the
+//! resource anyway, that request has nowhere to land and the call errors
+//! instead of silently passing. Both `ResourceKind::Alias` (phase 2a) and
+//! `ResourceKind::Rule` (phase 2b) are covered, since the dispatch in
+//! `rollback_mutation` is per-kind and a rule-only regression would not show
+//! up in the alias cases.
 
-use rustopnsmcp_core::changeset::{ControllerOps, StagedMutation};
+use rustopnsmcp_core::changeset::{ControllerOps, ResourceKind, StagedMutation};
 use rustopnsmcp_core::client::OpnsenseClient;
 use rustopnsmcp_core::inventory::Device;
 use std::collections::HashMap;
@@ -208,7 +213,7 @@ async fn rollback_of_a_delete_that_still_exists_is_a_noop_not_a_recreate() {
     // Deliberately no ALIASES_ADD_ITEM route.
     let client = client_against(routes).await;
 
-    let mutation = StagedMutation::delete(uuid);
+    let mutation = StagedMutation::delete(ResourceKind::Alias, uuid);
     let prior = serde_json::json!({"uuid": uuid, "name": "still_here", "type": "host"});
 
     client
@@ -236,11 +241,83 @@ async fn rollback_of_a_delete_that_landed_recreates_the_alias() {
     );
     let client = client_against(routes).await;
 
-    let mutation = StagedMutation::delete(uuid);
+    let mutation = StagedMutation::delete(ResourceKind::Alias, uuid);
     let prior = serde_json::json!({"uuid": uuid, "name": "gone", "type": "host"});
 
     client
         .rollback_mutation(&mutation, Some(&prior), None)
         .await
         .expect("rollback of a delete that actually landed must re-create the alias");
+}
+
+/// The same idempotency guarantee, exercised for phase 2b's `ResourceKind::Rule`:
+/// a rule delete whose reconciliation could not confirm it landed, but whose
+/// rule is still present under its original uuid, must not attempt a
+/// `addRule` re-create. Firewall rules have no name-uniqueness constraint
+/// like aliases do, so a wrongly-taken re-create path here would silently
+/// leave a live duplicate rule rather than erroring the way a duplicate
+/// alias name would.
+#[tokio::test]
+async fn rollback_of_a_rule_delete_that_still_exists_is_a_noop_not_a_recreate() {
+    let uuid = "44444444-4444-4444-8444-444444444444";
+    let mut routes = HashMap::new();
+    routes.insert(
+        rustopnsmcp_core::endpoints::filter_get_rule(uuid),
+        serde_json::json!({
+            "rule": {
+                "description": "still_here",
+                "action": {"pass": {"value": "Pass", "selected": 1}},
+                "interface": {"lan": {"value": "LAN", "selected": 1}},
+            }
+        }),
+    );
+    // Deliberately no FILTER_ADD_RULE route.
+    let client = client_against(routes).await;
+
+    let mutation = StagedMutation::delete(ResourceKind::Rule, uuid);
+    let prior = serde_json::json!({
+        "uuid": uuid,
+        "description": "still_here",
+        "action": "pass",
+        "interface": "lan",
+    });
+
+    client
+        .rollback_mutation(&mutation, Some(&prior), None)
+        .await
+        .expect(
+            "rollback of a rule delete whose rule still exists must be a no-op, not attempt a \
+             re-create against a device with no addRule fixture",
+        );
+}
+
+/// The rule mirror of `rollback_of_a_delete_that_landed_recreates_the_alias`:
+/// the rule is genuinely gone, so rollback must actually re-create it via
+/// `addRule` from the pre-image.
+#[tokio::test]
+async fn rollback_of_a_rule_delete_that_landed_recreates_the_rule() {
+    let uuid = "55555555-5555-4555-8555-555555555555";
+    let mut routes = HashMap::new();
+    routes.insert(
+        rustopnsmcp_core::endpoints::filter_get_rule(uuid),
+        serde_json::json!([]),
+    );
+    routes.insert(
+        rustopnsmcp_core::endpoints::FILTER_ADD_RULE.to_owned(),
+        serde_json::json!({"result": "saved", "uuid": "66666666-6666-4666-8666-666666666666"}),
+    );
+    let client = client_against(routes).await;
+
+    let mutation = StagedMutation::delete(ResourceKind::Rule, uuid);
+    let prior = serde_json::json!({
+        "uuid": uuid,
+        "description": "gone",
+        "action": "pass",
+        "interface": "lan",
+    });
+
+    client
+        .rollback_mutation(&mutation, Some(&prior), None)
+        .await
+        .expect("rollback of a rule delete that actually landed must re-create the rule");
 }

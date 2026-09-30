@@ -1,18 +1,22 @@
-//! Governed writes for OPNsense firewall aliases, mapped onto
-//! `mecmcp-changeset`'s change-set lifecycle.
+//! Governed writes for OPNsense firewall aliases and filter rules, mapped
+//! onto `mecmcp-changeset`'s change-set lifecycle.
 //!
-//! OPNsense's alias controller has no candidate configuration, no dry-run
-//! validation separate from the write itself, and no checkpoint to roll back
-//! to: `addItem`/`setItem`/`delItem` persist to `config.xml` immediately, and
-//! `reconfigure` is the only thing standing between that and the live `pf`
-//! tables. [`OpnsenseTransaction`] declares this plainly via [`Atomicity`], so
-//! shared code that renders approval prompts can say so rather than offering
-//! commit-confirmed semantics the vendor cannot deliver — the same shape
-//! `rustunifimcp` and `rustpanosmcp` already gate through.
+//! OPNsense's alias and filter controllers have no candidate configuration,
+//! no dry-run validation separate from the write itself, and no checkpoint to
+//! roll back to: `addItem`/`setItem`/`delItem` (aliases) and
+//! `addRule`/`setRule`/`delRule` (filter rules) persist to `config.xml`
+//! immediately, and `reconfigure`/`apply` is the only thing standing between
+//! that and the live `pf` tables/ruleset. [`OpnsenseTransaction`] declares
+//! this plainly via [`Atomicity`], so shared code that renders approval
+//! prompts can say so rather than offering commit-confirmed semantics the
+//! vendor cannot deliver — the same shape `rustunifimcp` and `rustpanosmcp`
+//! already gate through.
 //!
-//! Scope: this phase (2a) governs aliases only. Firewall rules follow in a
-//! later phase; a mutation naming any other resource kind has nowhere to go
-//! yet and is refused by [`validate::check_writable_fields`].
+//! Scope: phase 2a governs aliases, phase 2b (this phase) adds filter rules.
+//! A change set stages exactly one resource [`ResourceKind`] at a time —
+//! [`validate::check_single_resource_kind`] refuses a mix — because
+//! `reconfigure` and `apply` are separate device-side commits and this
+//! server's apply lifecycle runs only one commit per batch.
 
 pub mod apply;
 pub mod diff;
@@ -23,13 +27,14 @@ pub mod validate;
 
 pub use apply::{ControllerOps, Outcome, Reconciled, State, apply_sequentially};
 pub use diff::{Change, Diff, diff_against_preimage};
-pub use preimage::{Preimage, StagedMutation};
+pub use preimage::{Preimage, ResourceKind, StagedMutation};
 pub use record::{
     StagedAction, actions_for, actions_of, fingerprint_of, mutations_of, preimage_of,
 };
 pub use rollback::rollback_to_preimage;
 pub use validate::{
-    canonicalize_mutations, check_writable_fields, flatten_for_write, validate_locally,
+    canonicalize_mutations, check_single_resource_kind, check_writable_fields, flatten_for_write,
+    validate_locally,
 };
 
 // The shared crate exports `Atomicity` and `DeviceTransaction::atomicity()`,

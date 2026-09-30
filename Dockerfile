@@ -9,11 +9,9 @@
 # against a newer glibc that the Debian 13 runtime does not carry.
 
 # Builder stage: Debian 13 slim with Rust 1.98.1, matching rust-toolchain.toml.
-#
-# Not yet digest-pinned (sibling servers pin `FROM ... @sha256:...`): this
-# environment has no registry access to resolve the current amd64 digest.
-# Pin it in a follow-up before this ships.
-FROM rust:1.98.1-slim-trixie AS builder
+# Pinned to the multi-arch image index digest (matches what `rust:1.98-slim-trixie`
+# resolves to as of this pin; same digest rustunifimcp pins for that floating tag).
+FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS builder
 
 WORKDIR /build
 
@@ -41,9 +39,9 @@ COPY rustopnsmcp-core/ rustopnsmcp-core/
 RUN touch rustopnsmcp/src/main.rs rustopnsmcp-core/src/lib.rs && \
     cargo build --release --locked
 
-# Runtime stage: distroless Debian 13 with nonroot user. Not yet
-# digest-pinned; see the note on the builder stage above.
-FROM gcr.io/distroless/cc-debian13:nonroot
+# Runtime stage: distroless Debian 13 with nonroot user. Pinned to the
+# multi-arch image index digest (same digest rustunifimcp pins for `nonroot`).
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
 
 USER 65532:65532
 

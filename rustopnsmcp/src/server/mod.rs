@@ -22,8 +22,8 @@ use rmcp::{
 use rustopnsmcp_core::{
     changeset::{
         OpnsenseTransaction, Preimage, StagedMutation, State, actions_for, apply_sequentially,
-        canonicalize_mutations, check_writable_fields, diff_against_preimage, fingerprint_of,
-        mutations_of, preimage_of, validate_locally,
+        canonicalize_mutations, check_single_resource_kind, check_writable_fields,
+        diff_against_preimage, fingerprint_of, mutations_of, preimage_of, validate_locally,
     },
     client::OpnsenseClient,
     error::OpnsenseError,
@@ -256,6 +256,17 @@ impl OpnsenseServer {
         let diff = diff_against_preimage(preimage, mutations)
             .map_err(|error| Box::new(tool_error(format!("failed to compute diff: {error}"))))?;
         let atomicity = OpnsenseTransaction::atomicity();
+        let noun = mutations
+            .first()
+            .map_or("alias", |mutation| mutation.kind().noun());
+        let commit_verb = mutations
+            .first()
+            .map_or("reconfigure", |mutation| mutation.kind().commit_verb());
+        let identity_field = if noun == "alias" {
+            "name"
+        } else {
+            "description"
+        };
 
         let mut rendered = serde_json::json!({
             "device": device,
@@ -265,16 +276,18 @@ impl OpnsenseServer {
                 "atomic_apply": atomicity.atomic_apply,
                 "dry_run_validation": atomicity.dry_run_validation,
                 "guaranteed_rollback": atomicity.guaranteed_rollback,
-                "note": "OPNsense writes each alias to config.xml immediately and only \
-                         loads it into the live pf tables on reconfigure: a partial apply \
-                         is reachable and rollback is best-effort. reconfigure loads every \
-                         pending alias edit currently in config.xml into the live pf \
-                         tables, not only this change set's mutations — including any \
-                         unapproved edit made through the OPNsense GUI since this change \
-                         set was staged. Reconciling a create whose response was lost to a \
-                         transport failure searches for an alias by name; a concurrent GUI \
-                         create of that same name can be mistaken for this change set's own \
-                         write and later deleted on rollback.",
+                "note": format!(
+                    "OPNsense writes each {noun} to config.xml immediately and only loads it \
+                     into the live pf tables/ruleset on {commit_verb}: a partial apply is \
+                     reachable and rollback is best-effort. {commit_verb} loads every pending \
+                     {noun} edit currently in config.xml into the live pf tables/ruleset, not \
+                     only this change set's mutations — including any unapproved edit made \
+                     through the OPNsense GUI since this change set was staged. Reconciling a \
+                     create whose response was lost to a transport failure searches for a \
+                     {noun} by {identity_field}; a concurrent GUI create with the same \
+                     {identity_field} can be mistaken for this change set's own write and \
+                     later deleted on rollback.",
+                ),
             },
             "changes": diff.changes,
         });
@@ -722,7 +735,7 @@ impl OpnsenseServer {
 
     #[tool(
         name = "opnsense_create_change_set",
-        description = "Creates a new change set for firewall alias writes"
+        description = "Creates a new change set for firewall alias or filter rule writes"
     )]
     async fn opnsense_create_change_set(
         &self,
@@ -797,7 +810,8 @@ impl OpnsenseServer {
 
     #[tool(
         name = "opnsense_stage_change",
-        description = "Stages one or more alias changes into an existing change set"
+        description = "Stages one or more alias or filter rule changes into an existing change \
+                       set; all mutations in one change set must target the same resource kind"
     )]
     async fn opnsense_stage_change(
         &self,
@@ -860,12 +874,24 @@ impl OpnsenseServer {
 
         for spec in args.mutations {
             mutations.push(match spec {
-                changeset::MutationSpec::Create { body } => StagedMutation::create(body),
-                changeset::MutationSpec::Update { uuid, body } => {
-                    StagedMutation::update(uuid, body)
+                changeset::MutationSpec::Create { resource, body } => {
+                    StagedMutation::create(resource, body)
                 }
-                changeset::MutationSpec::Delete { uuid } => StagedMutation::delete(uuid),
+                changeset::MutationSpec::Update {
+                    resource,
+                    uuid,
+                    body,
+                } => StagedMutation::update(resource, uuid, body),
+                changeset::MutationSpec::Delete { resource, uuid } => {
+                    StagedMutation::delete(resource, uuid)
+                }
             });
+        }
+
+        // Checked before canonicalization/writable-field checks run per-kind
+        // logic against a batch that might mix kinds.
+        if let Err(e) = check_single_resource_kind(&mutations) {
+            return tool_error(format!("staged mutation refused: {e}"));
         }
 
         // Canonicalize multi-value fields (content/proto/categories) before
@@ -1047,8 +1073,8 @@ impl OpnsenseServer {
         let result = serde_json::json!({
             "change_set_id": record.id,
             "valid": true,
-            "note": "OPNsense has no server-side dry-run validation for aliases; this is \
-                     client-side only",
+            "note": "OPNsense has no server-side dry-run validation for aliases or filter \
+                     rules; this is client-side only",
         });
 
         tool_result(
@@ -1182,8 +1208,8 @@ impl OpnsenseServer {
 
     #[tool(
         name = "opnsense_apply_change_set",
-        description = "Applies the staged alias writes as a sequence of independent REST \
-                       calls, then loads them with reconfigure"
+        description = "Applies the staged alias or filter rule writes as a sequence of \
+                       independent REST calls, then loads them with reconfigure/apply"
     )]
     async fn opnsense_apply_change_set(
         &self,
@@ -1472,9 +1498,10 @@ impl ServerHandler for OpnsenseServer {
             ))
             .with_instructions(
                 "OPNsense MCP server. Device-addressed tools take (device, ...); the server \
-                 routes to the device by name from devices.json. Phase 2a adds governed \
-                 writes for firewall aliases through a plan -> digest -> human approve -> \
-                 apply-with-drift-check lifecycle; firewall rules remain read-only.",
+                 routes to the device by name from devices.json. Governed writes for firewall \
+                 aliases (phase 2a) and firewall filter rules (phase 2b) go through the same \
+                 plan -> digest -> human approve -> apply-with-drift-check lifecycle; a change \
+                 set stages exactly one resource kind at a time.",
             )
     }
 
@@ -1494,6 +1521,7 @@ impl ServerHandler for OpnsenseServer {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use rustopnsmcp_core::changeset::ResourceKind;
 
     /// The router and the registry must agree, in both directions.
     #[test]
@@ -1554,10 +1582,13 @@ mod tests {
     #[test]
     fn render_preview_redacts_secret_shaped_text_in_the_description() {
         let preimage = Preimage::from_resources(Vec::new());
-        let mutations = vec![StagedMutation::create(serde_json::json!({
-            "name": "test_alias",
-            "type": "host",
-        }))];
+        let mutations = vec![StagedMutation::create(
+            ResourceKind::Alias,
+            serde_json::json!({
+                "name": "test_alias",
+                "type": "host",
+            }),
+        )];
 
         let artifact = OpnsenseServer::render_preview(
             "home",
@@ -1577,11 +1608,14 @@ mod tests {
     }
 
     fn planned_record(owner: &str, device: &str, ttl: u64) -> ChangeSetRecord {
-        let mutations = vec![StagedMutation::create(serde_json::json!({
-            "name": "test_alias",
-            "type": "host",
-            "content": "10.0.0.1"
-        }))];
+        let mutations = vec![StagedMutation::create(
+            ResourceKind::Alias,
+            serde_json::json!({
+                "name": "test_alias",
+                "type": "host",
+                "content": "10.0.0.1"
+            }),
+        )];
         let preimage = Preimage::from_resources(Vec::new());
         let actions = actions_for(&mutations, &preimage);
         let fingerprint = fingerprint_of(&actions).expect("fingerprint");
