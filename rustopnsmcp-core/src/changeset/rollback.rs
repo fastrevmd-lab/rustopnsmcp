@@ -31,7 +31,7 @@ where
     for (forward_index, mutation) in succeeded.iter().enumerate().rev() {
         let prior_value = match mutation {
             StagedMutation::Create { .. } => None,
-            StagedMutation::Update { uuid, .. } | StagedMutation::Delete { uuid } => {
+            StagedMutation::Update { uuid, .. } | StagedMutation::Delete { uuid, .. } => {
                 preimage.get(uuid)
             }
         };

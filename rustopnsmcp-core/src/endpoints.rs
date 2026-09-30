@@ -75,6 +75,47 @@ pub fn aliases_del_item(uuid: &str) -> String {
 /// [`aliases_del_item`] is live until this runs.
 pub const ALIASES_RECONFIGURE: &str = "/api/firewall/alias/reconfigure";
 
+/// Create a firewall filter rule. Module `firewall`, controller `filter`.
+///
+/// Same immediate-persist-but-not-loaded semantics as [`ALIASES_ADD_ITEM`]:
+/// this writes to `config.xml` but has no effect on the live `pf` ruleset
+/// until [`FILTER_APPLY`] runs. Targets the MVC ("automation") rule set —
+/// see the [`FIREWALL_RULES_SEARCH`] caveat about legacy GUI rules.
+pub const FILTER_ADD_RULE: &str = "/api/firewall/filter/addRule";
+
+/// Fetch one firewall filter rule by UUID. Module `firewall`, controller `filter`.
+///
+/// # Panics
+///
+/// Never: `uuid` must already have passed [`crate::client::validate_uuid`]
+/// before this is called, since it is interpolated into the path.
+#[must_use]
+pub fn filter_get_rule(uuid: &str) -> String {
+    format!("/api/firewall/filter/getRule/{uuid}")
+}
+
+/// Update a firewall filter rule by UUID. Module `firewall`, controller `filter`.
+///
+/// Same immediate-persist-but-not-loaded semantics as [`FILTER_ADD_RULE`].
+#[must_use]
+pub fn filter_set_rule(uuid: &str) -> String {
+    format!("/api/firewall/filter/setRule/{uuid}")
+}
+
+/// Delete a firewall filter rule by UUID. Module `firewall`, controller `filter`.
+#[must_use]
+pub fn filter_del_rule(uuid: &str) -> String {
+    format!("/api/firewall/filter/delRule/{uuid}")
+}
+
+/// Load staged filter rule changes from `config.xml` into the live `pf`
+/// ruleset. Module `firewall`, controller `filter`.
+///
+/// This is the closest thing OPNsense's filter API has to a commit: nothing
+/// written by [`FILTER_ADD_RULE`], [`filter_set_rule`], or [`filter_del_rule`]
+/// is live until this runs.
+pub const FILTER_APPLY: &str = "/api/firewall/filter/apply";
+
 /// Outbound NAT rules, paginated search. Module `firewall`, controller `source_nat`.
 pub const NAT_OUTBOUND_SEARCH: &str = "/api/firewall/source_nat/search_rule";
 

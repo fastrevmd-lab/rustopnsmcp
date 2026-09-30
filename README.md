@@ -42,7 +42,16 @@ workflows.
   persist to `config.xml` immediately and only take effect once `apply`
   calls `reconfigure`; a partial apply is a reachable outcome.
 - **Phase 2b — governed writes, firewall rules:** the same lifecycle,
-  extended to firewall filter rules. Not yet started.
+  extended to firewall filter rules, through the same seven change-set
+  tools — a change set stages mutations against exactly one resource kind
+  (alias or rule) at a time. As with aliases, OPNsense has no candidate
+  configuration for filter rules: writes persist to `config.xml`
+  immediately and only take effect once `apply` calls the filter
+  controller's `apply` endpoint.
+
+None of this has been exercised against a live OPNsense instance yet — every
+test here runs against synthetic fixtures. The under-construction banner
+above stays until a live-device verification pass has run.
 
 Design and scope: [mecmcp#425](https://github.com/mechubsec/mecmcp/issues/425).
 

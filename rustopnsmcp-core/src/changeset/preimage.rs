@@ -1,25 +1,65 @@
-//! Pre-image capture and staged mutations for OPNsense firewall aliases.
+//! Pre-image capture and staged mutations for OPNsense firewall aliases and
+//! filter rules.
 //!
-//! OPNsense's alias controller has no discardable candidate: `addItem`,
-//! `setItem`, and `delItem` persist to `config.xml` immediately, and only
-//! `reconfigure` loads that into the live `pf` tables. There is nothing to
-//! diff a candidate against, so the pre-image — the alias as it stood before
-//! staging touched it — is what apply checks for drift against and what
-//! rollback replays.
+//! OPNsense's alias and filter controllers have no discardable candidate:
+//! `addItem`/`addRule`, `setItem`/`setRule`, and `delItem`/`delRule` persist to
+//! `config.xml` immediately, and only `reconfigure`/`apply` loads that into
+//! the live `pf` tables/ruleset. There is nothing to diff a candidate against,
+//! so the pre-image — the resource as it stood before staging touched it — is
+//! what apply checks for drift against and what rollback replays.
 
 use crate::error::OpnsenseError;
 use serde_json::Value;
 
-/// A snapshot of the aliases a change set will touch, captured before
+/// Which OPNsense resource controller a staged mutation targets.
+///
+/// A change set may stage mutations against exactly one kind: `reconfigure`
+/// for aliases and `apply` for filter rules are separate device-side commits,
+/// and mixing kinds in one change set would need both to run together for the
+/// batch to be fully loaded — see
+/// [`crate::changeset::validate::check_single_resource_kind`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    /// A firewall alias, governed by phase 2a.
+    Alias,
+    /// A firewall filter rule, governed by phase 2b.
+    Rule,
+}
+
+impl ResourceKind {
+    /// The noun this kind uses in previews and error messages.
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Alias => "alias",
+            Self::Rule => "firewall rule",
+        }
+    }
+
+    /// The name of the device-side call that loads staged writes from
+    /// `config.xml` into the live `pf` tables/ruleset for this kind.
+    #[must_use]
+    pub const fn commit_verb(self) -> &'static str {
+        match self {
+            Self::Alias => "reconfigure",
+            Self::Rule => "apply",
+        }
+    }
+}
+
+/// A snapshot of the resources a change set will touch, captured before
 /// staging writes anything.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Preimage {
-    /// Alias bodies as they stood at capture time, keyed by UUID.
+    /// Resource bodies as they stood at capture time, keyed by UUID.
     entries: Vec<Value>,
 }
 
 impl Preimage {
-    /// Construct a pre-image from already-fetched alias bodies.
+    /// Construct a pre-image from already-fetched resource bodies.
     ///
     /// Used both to build a fresh pre-image from live reads and to
     /// reconstruct one stored in a change set's actions.
@@ -30,14 +70,14 @@ impl Preimage {
 
     /// Capture a pre-image from a live device.
     ///
-    /// Fetches the current body of every alias a staged [`Update`](StagedMutation::Update)
+    /// Fetches the current body of every resource a staged [`Update`](StagedMutation::Update)
     /// or [`Delete`](StagedMutation::Delete) addresses. A [`Create`](StagedMutation::Create)
     /// has no prior state to capture.
     ///
     /// # Errors
     ///
-    /// Returns an error if any fetch fails, including "alias not found" for a
-    /// UUID the plan names but the device does not have.
+    /// Returns an error if any fetch fails, including "not found" for a UUID
+    /// the plan names but the device does not have.
     pub async fn capture(
         client: &crate::client::OpnsenseClient,
         mutations: &[StagedMutation],
@@ -47,7 +87,7 @@ impl Preimage {
             let Some(uuid) = mutation.resource_uuid() else {
                 continue;
             };
-            let body = client.get_alias_item(uuid).await?;
+            let body = client.get_item(mutation.kind(), uuid).await?;
             entries.push(body);
         }
         Ok(Self { entries })
@@ -82,59 +122,81 @@ impl Preimage {
     }
 }
 
-/// A planned mutation against one firewall alias.
+/// A planned mutation against one firewall alias or filter rule.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum StagedMutation {
-    /// Create a new alias.
+    /// Create a new resource.
     Create {
-        /// The alias body: `name`, `type`, `content`, and any other field
-        /// OPNsense's alias model accepts.
+        /// Which controller this mutation targets.
+        kind: ResourceKind,
+        /// The resource body: for an alias, `name`, `type`, `content`, and
+        /// any other field OPNsense's alias model accepts; for a rule,
+        /// `action`, `interface`, and any other field OPNsense's filter rule
+        /// model accepts.
         body: Value,
     },
-    /// Update an existing alias, addressed by UUID.
+    /// Update an existing resource, addressed by UUID.
     Update {
-        /// The alias UUID.
+        /// Which controller this mutation targets.
+        kind: ResourceKind,
+        /// The resource UUID.
         uuid: String,
-        /// The new alias body.
+        /// The new resource body.
         body: Value,
     },
-    /// Delete an existing alias, addressed by UUID.
+    /// Delete an existing resource, addressed by UUID.
     Delete {
-        /// The alias UUID.
+        /// Which controller this mutation targets.
+        kind: ResourceKind,
+        /// The resource UUID.
         uuid: String,
     },
 }
 
 impl StagedMutation {
-    /// Stage an alias creation.
+    /// Stage a resource creation.
     #[must_use]
-    pub fn create(body: Value) -> Self {
-        Self::Create { body }
+    pub fn create(kind: ResourceKind, body: Value) -> Self {
+        Self::Create { kind, body }
     }
 
-    /// Stage an alias update.
+    /// Stage a resource update.
     #[must_use]
-    pub fn update(uuid: impl Into<String>, body: Value) -> Self {
+    pub fn update(kind: ResourceKind, uuid: impl Into<String>, body: Value) -> Self {
         Self::Update {
+            kind,
             uuid: uuid.into(),
             body,
         }
     }
 
-    /// Stage an alias deletion.
+    /// Stage a resource deletion.
     #[must_use]
-    pub fn delete(uuid: impl Into<String>) -> Self {
-        Self::Delete { uuid: uuid.into() }
+    pub fn delete(kind: ResourceKind, uuid: impl Into<String>) -> Self {
+        Self::Delete {
+            kind,
+            uuid: uuid.into(),
+        }
     }
 
-    /// The alias this mutation addresses by UUID.
+    /// Which controller this mutation targets.
+    #[must_use]
+    pub const fn kind(&self) -> ResourceKind {
+        match self {
+            Self::Create { kind, .. } | Self::Update { kind, .. } | Self::Delete { kind, .. } => {
+                *kind
+            }
+        }
+    }
+
+    /// The resource this mutation addresses by UUID.
     ///
     /// `None` for a create, which has no UUID until apply assigns one.
     #[must_use]
     pub fn resource_uuid(&self) -> Option<&str> {
         match self {
-            Self::Update { uuid, .. } | Self::Delete { uuid } => Some(uuid.as_str()),
+            Self::Update { uuid, .. } | Self::Delete { uuid, .. } => Some(uuid.as_str()),
             Self::Create { .. } => None,
         }
     }
@@ -143,19 +205,23 @@ impl StagedMutation {
     #[must_use]
     pub fn preview(&self) -> String {
         match self {
-            Self::Create { body } => {
-                let name = body.get("name").and_then(Value::as_str).unwrap_or("?");
-                format!("create alias '{name}'")
+            Self::Create { kind, body } => {
+                let name = body
+                    .get("name")
+                    .or_else(|| body.get("description"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                format!("create {} '{name}'", kind.noun())
             }
-            Self::Update { uuid, .. } => format!("update alias {uuid}"),
-            Self::Delete { uuid } => format!("delete alias {uuid}"),
+            Self::Update { kind, uuid, .. } => format!("update {} {uuid}", kind.noun()),
+            Self::Delete { kind, uuid } => format!("delete {} {uuid}", kind.noun()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Preimage, StagedMutation};
+    use super::{Preimage, ResourceKind, StagedMutation};
     use serde_json::json;
 
     /// A mutation addressing a UUID the pre-image never captured must not be
@@ -164,16 +230,19 @@ mod tests {
     #[test]
     fn a_mutation_outside_the_preimage_is_not_covered() {
         let preimage = Preimage::from_resources(vec![json!({"uuid": "a", "name": "known"})]);
-        let staged = StagedMutation::update("b", json!({"name": "x"}));
+        let staged = StagedMutation::update(ResourceKind::Alias, "b", json!({"name": "x"}));
         assert!(!preimage.covers(&staged));
-        assert!(preimage.covers(&StagedMutation::update("a", json!({}))));
+        assert!(preimage.covers(&StagedMutation::update(ResourceKind::Alias, "a", json!({}))));
     }
 
     /// Creates need no pre-image coverage: there is nothing to have captured.
     #[test]
     fn a_create_is_always_covered() {
         let preimage = Preimage::from_resources(Vec::new());
-        assert!(preimage.covers(&StagedMutation::create(json!({"name": "new"}))));
+        assert!(preimage.covers(&StagedMutation::create(
+            ResourceKind::Alias,
+            json!({"name": "new"})
+        )));
     }
 
     #[test]
@@ -187,5 +256,15 @@ mod tests {
             Some(json!("two"))
         );
         assert!(preimage.get("c").is_none());
+    }
+
+    #[test]
+    fn a_rule_mutation_previews_with_the_rule_noun() {
+        let create = StagedMutation::create(
+            ResourceKind::Rule,
+            json!({"description": "Allow LAN to any", "action": "pass", "interface": "lan"}),
+        );
+        assert_eq!(create.preview(), "create firewall rule 'Allow LAN to any'");
+        assert_eq!(create.kind(), ResourceKind::Rule);
     }
 }

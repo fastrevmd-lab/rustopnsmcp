@@ -123,7 +123,7 @@ pub fn fingerprint_of(actions: &[StagedAction]) -> Result<String, OpnsenseError>
 #[cfg(test)]
 mod tests {
     use super::{actions_for, fingerprint_of, mutations_of, preimage_of};
-    use crate::changeset::{Preimage, StagedMutation};
+    use crate::changeset::{Preimage, ResourceKind, StagedMutation};
     use serde_json::json;
 
     fn live_alias() -> Preimage {
@@ -137,10 +137,11 @@ mod tests {
     fn plan() -> Vec<StagedMutation> {
         vec![
             StagedMutation::update(
+                ResourceKind::Alias,
                 "dddddddddddddddddddddddd",
                 json!({ "content": "10.0.0.0/23" }),
             ),
-            StagedMutation::create(json!({ "name": "new_alias" })),
+            StagedMutation::create(ResourceKind::Alias, json!({ "name": "new_alias" })),
         ]
     }
 

@@ -89,7 +89,7 @@ pub trait ControllerOps {
         created_uuid: Option<&str>,
     ) -> impl std::future::Future<Output = Result<(), crate::error::OpnsenseError>> + Send;
 
-    /// Whether the aliases this change set touches still look as they did
+    /// Whether the resources this change set touches still look as they did
     /// when the pre-image was captured.
     ///
     /// `Err` means the check could not be completed. Callers must treat that
@@ -101,23 +101,29 @@ pub trait ControllerOps {
         mutations: &[StagedMutation],
     ) -> impl std::future::Future<Output = Result<bool, crate::error::OpnsenseError>> + Send;
 
-    /// Fetch one alias for verification.
+    /// Fetch one resource for verification.
     ///
-    /// Returns `None` if the alias does not exist (expected after a delete).
-    fn fetch_alias(
+    /// Returns `None` if the resource does not exist (expected after a
+    /// delete).
+    fn fetch_resource(
         &self,
+        kind: super::preimage::ResourceKind,
         uuid: &str,
     ) -> impl std::future::Future<
         Output = Result<Option<serde_json::Value>, crate::error::OpnsenseError>,
     > + Send;
 
-    /// Load the staged writes into the live `pf` alias tables.
+    /// Load the staged writes into the live `pf` tables/ruleset.
     ///
-    /// This is `reconfigure`: nothing written by `apply_mutation` is live
-    /// until this runs, and it runs once for the whole batch rather than once
-    /// per mutation.
+    /// This is `reconfigure` (aliases) or `apply` (filter rules): nothing
+    /// written by `apply_mutation` is live until this runs, and it runs once
+    /// for the whole batch rather than once per mutation. A change set stages
+    /// exactly one resource kind (see
+    /// [`super::validate::check_single_resource_kind`]), so one call per
+    /// batch is always the right amount of commits.
     fn reconfigure(
         &self,
+        kind: super::preimage::ResourceKind,
     ) -> impl std::future::Future<Output = Result<(), crate::error::OpnsenseError>> + Send;
 
     /// Determine whether a mutation that failed with an indeterminate error
@@ -285,8 +291,23 @@ where
         };
     }
 
-    // Every write landed; load them into the live pf tables and confirm.
-    match controller.reconfigure().await {
+    // Every write landed; load them into the live pf tables/ruleset and
+    // confirm. `mutations` is never empty here: the coordinator refuses to
+    // persist a change set with no actions, so a change set that reached
+    // apply always staged at least one mutation, and every mutation in it
+    // shares one kind (`check_single_resource_kind`).
+    let Some(kind) = mutations.first().map(StagedMutation::kind) else {
+        return Outcome {
+            state: State::Applied,
+            succeeded,
+            failed: Vec::new(),
+            attempted_and_failed: Vec::new(),
+            never_attempted: Vec::new(),
+            rollback_failures: Vec::new(),
+            verification_failure: None,
+        };
+    };
+    match controller.reconfigure(kind).await {
         Ok(()) => {
             let (state, verification_failure) =
                 match verify_applied(controller, mutations, &created_uuids).await {
@@ -333,11 +354,11 @@ where
     }
 }
 
-/// Re-fetch each touched alias and compare against the desired state.
+/// Re-fetch each touched resource and compare against the desired state.
 ///
 /// # Errors
 ///
-/// Returns an error describing which aliases failed verification, or if
+/// Returns an error describing which resources failed verification, or if
 /// verification itself could not run.
 async fn verify_applied<C>(
     controller: &C,
@@ -352,15 +373,18 @@ where
     let mut failed_verifications = Vec::new();
 
     for (index, mutation) in mutations.iter().enumerate() {
+        let kind = mutation.kind();
         match mutation {
             StagedMutation::Create { .. } => {
                 let Some(uuid) = created_uuids.get(&index) else {
                     continue;
                 };
-                match controller.fetch_alias(uuid).await {
+                match controller.fetch_resource(kind, uuid).await {
                     Ok(Some(_)) => {}
-                    Ok(None) => failed_verifications
-                        .push(format!("create {uuid}: alias does not exist after apply")),
+                    Ok(None) => failed_verifications.push(format!(
+                        "create {uuid}: {} does not exist after apply",
+                        kind.noun()
+                    )),
                     Err(e) => {
                         return Err(OpnsenseError::Malformed(format!(
                             "could not verify create {uuid}: {e}"
@@ -368,48 +392,56 @@ where
                     }
                 }
             }
-            StagedMutation::Update { uuid, body } => match controller.fetch_alias(uuid).await {
-                Ok(Some(fetched)) => {
-                    // `fetched` is `getItem` shape; flatten it before
-                    // comparing against the staged (flat) body, or every
-                    // option/list field would mismatch regardless of whether
-                    // it actually landed.
-                    let flattened = super::validate::flatten_for_write(&fetched);
-                    let mut mismatched: Vec<&str> = Vec::new();
-                    if let Some(fields) = body.as_object() {
-                        for (key, value) in fields {
-                            if flattened.get(key) != Some(value) {
-                                mismatched.push(key.as_str());
+            StagedMutation::Update { uuid, body, .. } => {
+                match controller.fetch_resource(kind, uuid).await {
+                    Ok(Some(fetched)) => {
+                        // `fetched` is `getItem`/`getRule` shape; flatten it
+                        // before comparing against the staged (flat) body, or
+                        // every option/list field would mismatch regardless
+                        // of whether it actually landed.
+                        let flattened = super::validate::flatten_for_write(kind, &fetched);
+                        let mut mismatched: Vec<&str> = Vec::new();
+                        if let Some(fields) = body.as_object() {
+                            for (key, value) in fields {
+                                if flattened.get(key) != Some(value) {
+                                    mismatched.push(key.as_str());
+                                }
                             }
                         }
+                        if !mismatched.is_empty() {
+                            failed_verifications.push(format!(
+                                "update {uuid}: field mismatch after apply ({})",
+                                mismatched.join(", ")
+                            ));
+                        }
                     }
-                    if !mismatched.is_empty() {
+                    Ok(None) => {
                         failed_verifications.push(format!(
-                            "update {uuid}: field mismatch after apply ({})",
-                            mismatched.join(", ")
+                            "update {uuid}: {} missing after apply",
+                            kind.noun()
                         ));
                     }
+                    Err(e) => {
+                        return Err(OpnsenseError::Malformed(format!(
+                            "could not verify update {uuid}: {e}"
+                        )));
+                    }
                 }
-                Ok(None) => {
-                    failed_verifications.push(format!("update {uuid}: alias missing after apply"));
+            }
+            StagedMutation::Delete { uuid, .. } => {
+                match controller.fetch_resource(kind, uuid).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        failed_verifications
+                            .push(format!("delete {uuid}: {} still exists", kind.noun()));
+                    }
+                    Err(e) => {
+                        return Err(OpnsenseError::Malformed(format!(
+                            "could not verify delete {uuid}: {e}"
+                        )));
+                    }
                 }
-                Err(e) => {
-                    return Err(OpnsenseError::Malformed(format!(
-                        "could not verify update {uuid}: {e}"
-                    )));
-                }
-            },
-            StagedMutation::Delete { uuid } => match controller.fetch_alias(uuid).await {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    failed_verifications.push(format!("delete {uuid}: alias still exists"));
-                }
-                Err(e) => {
-                    return Err(OpnsenseError::Malformed(format!(
-                        "could not verify delete {uuid}: {e}"
-                    )));
-                }
-            },
+            }
         }
     }
 
@@ -427,6 +459,7 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::preimage::ResourceKind;
     use super::*;
     use crate::error::OpnsenseError;
     use std::collections::VecDeque;
@@ -499,8 +532,9 @@ mod tests {
             Ok(true)
         }
 
-        async fn fetch_alias(
+        async fn fetch_resource(
             &self,
+            _kind: super::super::preimage::ResourceKind,
             _uuid: &str,
         ) -> Result<Option<serde_json::Value>, OpnsenseError> {
             self.fetch_alias_results
@@ -510,7 +544,10 @@ mod tests {
                 .unwrap_or(Ok(Some(serde_json::json!({}))))
         }
 
-        async fn reconfigure(&self) -> Result<(), OpnsenseError> {
+        async fn reconfigure(
+            &self,
+            _kind: super::super::preimage::ResourceKind,
+        ) -> Result<(), OpnsenseError> {
             self.reconfigure_result
                 .lock()
                 .unwrap()
@@ -532,8 +569,14 @@ mod tests {
 
     fn two_creates() -> Vec<StagedMutation> {
         vec![
-            StagedMutation::create(serde_json::json!({"name": "a", "type": "host"})),
-            StagedMutation::create(serde_json::json!({"name": "b", "type": "host"})),
+            StagedMutation::create(
+                ResourceKind::Alias,
+                serde_json::json!({"name": "a", "type": "host"}),
+            ),
+            StagedMutation::create(
+                ResourceKind::Alias,
+                serde_json::json!({"name": "b", "type": "host"}),
+            ),
         ]
     }
 
@@ -682,6 +725,7 @@ mod tests {
             "name": "before",
         })]);
         let mutations = vec![StagedMutation::update(
+            ResourceKind::Alias,
             "u1",
             serde_json::json!({"name": "after"}),
         )];
@@ -715,7 +759,7 @@ mod tests {
             "uuid": "u1",
             "name": "gone",
         })]);
-        let mutations = vec![StagedMutation::delete("u1")];
+        let mutations = vec![StagedMutation::delete(ResourceKind::Alias, "u1")];
         let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
 
         assert_eq!(outcome.state, State::Partial);
@@ -746,6 +790,7 @@ mod tests {
 
         let preimage = Preimage::from_resources(Vec::new());
         let mutations = vec![StagedMutation::create(
+            ResourceKind::Alias,
             serde_json::json!({"name": "a", "type": "host"}),
         )];
         let outcome = apply_sequentially(&controller, &preimage, &mutations).await;
@@ -783,6 +828,7 @@ mod tests {
             "content": "10.0.0.1",
         })]);
         let mutations = vec![StagedMutation::update(
+            ResourceKind::Alias,
             "u1",
             serde_json::json!({"name": "web_servers", "content": "10.0.0.1"}),
         )];
@@ -818,6 +864,7 @@ mod tests {
             "content": "10.0.0.9",
         })]);
         let mut mutations = vec![StagedMutation::update(
+            ResourceKind::Alias,
             "u1",
             serde_json::json!({"name": "web_servers", "content": "10.0.0.2,10.0.0.1"}),
         )];

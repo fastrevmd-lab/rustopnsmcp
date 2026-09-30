@@ -1,12 +1,15 @@
-//! Change-set lifecycle tools for OPNsense firewall aliases.
+//! Change-set lifecycle tools for OPNsense firewall aliases and filter
+//! rules.
 //!
-//! OPNsense's alias controller has no candidate configuration, no dry-run
-//! validation, and no checkpoint to roll back to. The seven tools below
-//! implement the change-control lifecycle — plan, digest, human approve,
-//! apply with drift check — over that immediate-write REST API as a
+//! OPNsense's alias and filter controllers have no candidate configuration,
+//! no dry-run validation, and no checkpoint to roll back to. The seven tools
+//! below implement the change-control lifecycle — plan, digest, human
+//! approve, apply with drift check — over that immediate-write REST API as a
 //! best-effort approximation, with explicit honesty about what cannot be
-//! guaranteed.
+//! guaranteed. Each change set stages mutations against exactly one resource
+//! kind; see [`crate::changeset::ResourceKind`].
 
+use crate::changeset::ResourceKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -14,16 +17,17 @@ use serde::{Deserialize, Serialize};
 pub const DESCRIPTIONS: &[(&str, &str)] = &[
     (
         "opnsense_create_change_set",
-        "Creates a new change set for firewall alias writes. Returns the change set ID. \
-         Nothing is staged yet; stage into it with opnsense_stage_change.",
+        "Creates a new change set for firewall alias or filter rule writes. Returns the \
+         change set ID. Nothing is staged yet; stage into it with opnsense_stage_change.",
     ),
     (
         "opnsense_stage_change",
-        "Stages one or more alias creates, updates, or deletes into an existing change set. \
-         Each change is recorded as a planned mutation against live configuration. OPNsense \
-         writes each alias to config.xml immediately but does not load it into the live pf \
-         tables until apply, so staging is a planning step: it snapshots the current alias \
-         state as a pre-image and defers the actual writes until apply.",
+        "Stages one or more alias or filter rule creates, updates, or deletes into an \
+         existing change set. All mutations in one change set must target the same resource \
+         kind. Each change is recorded as a planned mutation against live configuration. \
+         OPNsense writes each resource to config.xml immediately but does not load it into \
+         the live pf tables/ruleset until apply, so staging is a planning step: it snapshots \
+         the current resource state as a pre-image and defers the actual writes until apply.",
     ),
     (
         "opnsense_diff_change_set",
@@ -35,9 +39,9 @@ pub const DESCRIPTIONS: &[(&str, &str)] = &[
     (
         "opnsense_validate_change_set",
         "Validates the change set as far as possible without applying it. OPNsense has no \
-         server-side dry-run validation for aliases, so this performs client-side checks \
-         only: pre-image coverage and writable-field constraints. It cannot detect \
-         validation failures the device would report on the write itself.",
+         server-side dry-run validation for aliases or filter rules, so this performs \
+         client-side checks only: pre-image coverage and writable-field constraints. It \
+         cannot detect validation failures the device would report on the write itself.",
     ),
     (
         "opnsense_approve_change_set",
@@ -50,11 +54,11 @@ pub const DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "opnsense_apply_change_set",
-        "Applies the staged alias writes as a sequence of independent REST calls, then loads \
-         them into the live pf tables with a single reconfigure call. OPNsense has no \
-         candidate configuration and applies each alias one request at a time, so a partial \
-         failure is a reachable outcome and is recorded as partial. Rollback replays a \
-         stored pre-image and is best-effort; it can itself fail.",
+        "Applies the staged writes as a sequence of independent REST calls, then loads them \
+         into the live pf tables/ruleset with a single reconfigure/apply call. OPNsense has \
+         no candidate configuration and applies each resource one request at a time, so a \
+         partial failure is a reachable outcome and is recorded as partial. Rollback replays \
+         a stored pre-image and is best-effort; it can itself fail.",
     ),
     (
         "opnsense_get_change_set",
@@ -82,29 +86,41 @@ pub struct StageChangeArgs {
     pub device: String,
     /// The change set ID to stage into.
     pub change_set_id: String,
-    /// The alias mutations to stage.
+    /// The mutations to stage, all against the same resource kind.
     pub mutations: Vec<MutationSpec>,
 }
 
-/// A mutation specification for staging, addressed to one firewall alias.
+/// A mutation specification for staging, addressed to one firewall alias or
+/// filter rule.
+///
+/// All mutations in a `mutations` list must share the same `resource`; a
+/// change set stages exactly one resource kind at a time (see
+/// `crate::changeset::validate::check_single_resource_kind`).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum MutationSpec {
-    /// Create a new alias.
+    /// Create a new resource.
     Create {
-        /// The alias body: at minimum `name` and `type`.
+        /// Which resource controller this mutation targets.
+        resource: ResourceKind,
+        /// The resource body: for an alias, at minimum `name` and `type`;
+        /// for a rule, at minimum `action` and `interface`.
         body: serde_json::Value,
     },
-    /// Update an existing alias.
+    /// Update an existing resource.
     Update {
-        /// The alias UUID.
+        /// Which resource controller this mutation targets.
+        resource: ResourceKind,
+        /// The resource UUID.
         uuid: String,
         /// The fields to change.
         body: serde_json::Value,
     },
-    /// Delete an existing alias.
+    /// Delete an existing resource.
     Delete {
-        /// The alias UUID.
+        /// Which resource controller this mutation targets.
+        resource: ResourceKind,
+        /// The resource UUID.
         uuid: String,
     },
 }

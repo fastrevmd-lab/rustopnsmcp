@@ -46,9 +46,11 @@ pub fn diff_against_preimage(
         .iter()
         .map(|mutation| {
             let (before, after) = match mutation {
-                StagedMutation::Create { body } => (None, Some(body.clone())),
-                StagedMutation::Update { uuid, body } => (preimage.get(uuid), Some(body.clone())),
-                StagedMutation::Delete { uuid } => (preimage.get(uuid), None),
+                StagedMutation::Create { body, .. } => (None, Some(body.clone())),
+                StagedMutation::Update { uuid, body, .. } => {
+                    (preimage.get(uuid), Some(body.clone()))
+                }
+                StagedMutation::Delete { uuid, .. } => (preimage.get(uuid), None),
             };
 
             Change {
@@ -69,6 +71,7 @@ pub fn diff_against_preimage(
 #[cfg(test)]
 mod tests {
     use super::{Preimage, StagedMutation, diff_against_preimage};
+    use crate::changeset::ResourceKind;
     use serde_json::json;
 
     /// An empty diff is not the same as a diff that was never computed.
@@ -89,7 +92,11 @@ mod tests {
             "name": "before_value"
         })]);
 
-        let mutations = vec![StagedMutation::update("u1", json!({"name": "after_value"}))];
+        let mutations = vec![StagedMutation::update(
+            ResourceKind::Alias,
+            "u1",
+            json!({"name": "after_value"}),
+        )];
 
         let diff = diff_against_preimage(&preimage, &mutations).expect("diff");
 
@@ -109,7 +116,7 @@ mod tests {
     #[test]
     fn a_delete_has_a_before_but_no_after() {
         let preimage = Preimage::from_resources(vec![json!({"uuid": "u1", "name": "gone"})]);
-        let mutations = vec![StagedMutation::delete("u1")];
+        let mutations = vec![StagedMutation::delete(ResourceKind::Alias, "u1")];
 
         let diff = diff_against_preimage(&preimage, &mutations).expect("diff");
         assert!(diff.changes[0].before.is_some());
@@ -119,7 +126,10 @@ mod tests {
     #[test]
     fn a_create_has_no_before_but_has_an_after() {
         let preimage = Preimage::from_resources(Vec::new());
-        let mutations = vec![StagedMutation::create(json!({"name": "brand_new"}))];
+        let mutations = vec![StagedMutation::create(
+            ResourceKind::Alias,
+            json!({"name": "brand_new"}),
+        )];
 
         let diff = diff_against_preimage(&preimage, &mutations).expect("diff");
         assert!(diff.changes[0].before.is_none());
