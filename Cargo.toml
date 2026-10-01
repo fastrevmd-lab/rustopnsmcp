@@ -42,20 +42,16 @@ tokio-rustls = "0.26"
 # mecmcp-changeset is the governed-write lifecycle (plan -> digest -> human
 # approve -> apply with drift check); every other crate here is read-only
 # support (transport, auth, audit, secrets, inventory).
-mecmcp-audit     = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-auth      = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-changeset = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-http      = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-inventory = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-runtime   = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-secret    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-server    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-mecmcp-transport = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", tag = "v0.24.1" }
-# TEMPORARY: mecmcp-redact was added to mecmcp's main branch (#386) after
-# v0.24.1 was tagged and has not shipped in a released tag yet. Pinned to a
-# rev, not a tag, until a release carries it — replace `rev` with the tag
-# once one does, matching every other entry above.
-mecmcp-redact    = { version = "0.24.1", git = "https://github.com/mechubsec/mecmcp", rev = "9112ce84bfefbab66d0ead3be6bbffe33f04c4f2" }
+mecmcp-audit     = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-auth      = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-changeset = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-http      = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-inventory = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-runtime   = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-secret    = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-server    = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-transport = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
+mecmcp-redact    = { version = "0.25.0", git = "https://github.com/mechubsec/mecmcp", tag = "v0.25.0" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
