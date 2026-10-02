@@ -563,7 +563,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_firmware_status", read::firmware_status(&client).await)
+        Self::respond(
+            "opnsense_firmware_status",
+            read::firmware_status(&client).await,
+        )
     }
 
     #[tool(
@@ -588,7 +591,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_list_interfaces", read::list_interfaces(&client).await)
+        Self::respond(
+            "opnsense_list_interfaces",
+            read::list_interfaces(&client).await,
+        )
     }
 
     #[tool(
@@ -641,7 +647,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_list_firewall_rules", read::list_firewall_rules(&client, &args).await)
+        Self::respond(
+            "opnsense_list_firewall_rules",
+            read::list_firewall_rules(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -666,7 +675,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_list_aliases", read::list_aliases(&client, &args).await)
+        Self::respond(
+            "opnsense_list_aliases",
+            read::list_aliases(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -692,7 +704,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_list_nat_rules", read::list_nat_rules(&client, &args).await)
+        Self::respond(
+            "opnsense_list_nat_rules",
+            read::list_nat_rules(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -717,7 +732,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_list_routes", read::list_routes(&client, &args).await)
+        Self::respond(
+            "opnsense_list_routes",
+            read::list_routes(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -743,7 +761,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond("opnsense_list_dhcp_leases", read::list_dhcp_leases(&client, &args).await)
+        Self::respond(
+            "opnsense_list_dhcp_leases",
+            read::list_dhcp_leases(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -1506,7 +1527,10 @@ impl OpnsenseServer {
     /// carries whatever it carries, and this is the one place a VPN PSK or an
     /// embedded credential in a description field is scrubbed before it
     /// reaches the caller.
-    fn respond(tool: &'static str, result: Result<serde_json::Value, OpnsenseError>) -> CallToolResult {
+    fn respond(
+        tool: &'static str,
+        result: Result<serde_json::Value, OpnsenseError>,
+    ) -> CallToolResult {
         match result {
             Ok(mut json) => {
                 mecmcp_redact::redact_json_value_with_profile(&mut json, &OPNSENSE_PROFILE);
