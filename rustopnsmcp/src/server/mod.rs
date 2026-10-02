@@ -1051,22 +1051,13 @@ impl OpnsenseServer {
             Err(e) => return tool_error(format!("failed to compute diff: {e}")),
         };
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "change_set_id": record.id,
             "computed": diff.computed,
             "changes": diff.changes,
         });
-        mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
 
-        tool_result(
-            Ok::<_, String>(result),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-            OutputRedaction::AlreadyRedacted {
-                tool: "opnsense_diff_change_set",
-                redacted_by: "OPNSENSE_PROFILE",
-            },
-        )
+        Self::already_redacted_result("opnsense_diff_change_set", result)
     }
 
     #[tool(
@@ -1225,7 +1216,7 @@ impl OpnsenseServer {
             }
         };
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "change_set_id": outcome.change_set_id,
             "state": outcome.state.as_str(),
             "approved_by": outcome.approver,
@@ -1238,17 +1229,7 @@ impl OpnsenseServer {
         // it, but redacting again here is what keeps this call site correct
         // on its own rather than relying on staging-time behavior a future
         // change could quietly break.
-        mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
-
-        tool_result(
-            Ok::<_, String>(result),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-            OutputRedaction::AlreadyRedacted {
-                tool: "opnsense_approve_change_set",
-                redacted_by: "OPNSENSE_PROFILE",
-            },
-        )
+        Self::already_redacted_result("opnsense_approve_change_set", result)
     }
 
     #[tool(
@@ -1444,7 +1425,7 @@ impl OpnsenseServer {
         }
 
         if let Some(draft) = self.draft(&args.change_set_id, &args.device) {
-            let mut result = serde_json::json!({
+            let result = serde_json::json!({
                 "change_set_id": args.change_set_id,
                 "device": draft.device,
                 "description": draft.description,
@@ -1454,16 +1435,7 @@ impl OpnsenseServer {
                 "note": "nothing is staged yet; this draft is held in memory and is \
                          lost on restart",
             });
-            mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
-            return tool_result(
-                Ok::<_, String>(result),
-                ResultFormat::PrettyJson,
-                RESULT_LIMITS,
-                OutputRedaction::AlreadyRedacted {
-                    tool: "opnsense_get_change_set",
-                    redacted_by: "OPNSENSE_PROFILE",
-                },
-            );
+            return Self::already_redacted_result("opnsense_get_change_set", result);
         }
 
         if let Err(error) = self
@@ -1487,7 +1459,7 @@ impl OpnsenseServer {
 
         let description = Self::description_of(&record).unwrap_or_default();
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "change_set_id": record.id,
             "device": record.device,
             "description": description,
@@ -1505,17 +1477,8 @@ impl OpnsenseServer {
             "expected_preimage_fingerprint": record.expected_candidate_fingerprint,
             "preview": record.preview.as_ref().map(|preview| preview.artifact.clone()),
         });
-        mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
 
-        tool_result(
-            Ok::<_, String>(result),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-            OutputRedaction::AlreadyRedacted {
-                tool: "opnsense_get_change_set",
-                redacted_by: "OPNSENSE_PROFILE",
-            },
-        )
+        Self::already_redacted_result("opnsense_get_change_set", result)
     }
 }
 
@@ -1532,20 +1495,33 @@ impl OpnsenseServer {
         result: Result<serde_json::Value, OpnsenseError>,
     ) -> CallToolResult {
         match result {
-            Ok(mut json) => {
-                mecmcp_redact::redact_json_value_with_profile(&mut json, &OPNSENSE_PROFILE);
-                tool_result(
-                    Ok::<_, String>(json),
-                    ResultFormat::PrettyJson,
-                    RESULT_LIMITS,
-                    OutputRedaction::AlreadyRedacted {
-                        tool,
-                        redacted_by: "OPNSENSE_PROFILE",
-                    },
-                )
-            }
+            Ok(json) => Self::already_redacted_result(tool, json),
             Err(error) => tool_error(error),
         }
+    }
+
+    /// Redact `value` with [`OPNSENSE_PROFILE`] and wrap it as a tool result
+    /// tagged `OutputRedaction::AlreadyRedacted`.
+    ///
+    /// This is the single call site every `AlreadyRedacted`-tagged tool
+    /// result goes through — `respond` above, and each change-set tool that
+    /// redacts inline before returning its own result shape. Routing every
+    /// one of them through the same function is what lets a unit test
+    /// exercise the exact code the handlers run: if a future edit dropped
+    /// the redaction call from here, every caller — and the test — would
+    /// fail together, rather than a handler drifting from a copy of this
+    /// logic the test never touches.
+    fn already_redacted_result(tool: &'static str, mut value: serde_json::Value) -> CallToolResult {
+        mecmcp_redact::redact_json_value_with_profile(&mut value, &OPNSENSE_PROFILE);
+        tool_result(
+            Ok::<_, String>(value),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+            OutputRedaction::AlreadyRedacted {
+                tool,
+                redacted_by: "OPNSENSE_PROFILE",
+            },
+        )
     }
 }
 
@@ -1683,11 +1659,18 @@ mod tests {
     /// plants, so a tool that leaked the *wrong* secret would still be
     /// caught (mirrors `mecmcp_redact::testing::tools_leaking_secrets`'s own
     /// coverage rationale).
+    ///
+    /// The marker (`PLANTX<tool>Q9`) contains none of
+    /// `mecmcp_redact`'s denylisted words (no "secret", "token", "key", ...),
+    /// so a match here proves the `password` field or the `key=value` free-text
+    /// shape was actually recognised — not that the marker itself happened to
+    /// contain a banned word, which is what let an earlier version of this
+    /// test pass without the inline redaction call ever running.
     #[test]
     fn respond_redacts_every_known_opnsense_secret_shape() {
         let secrets: Vec<String> = RESPOND_REDACTED_TOOLS
             .iter()
-            .map(|tool| format!("FAKEsecret_{tool}"))
+            .map(|tool| format!("PLANTX{tool}Q9"))
             .collect();
         let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
 
@@ -1703,10 +1686,13 @@ mod tests {
                     .copied()
                     .find(|name| *name == tool)
                     .expect("tool is drawn from this same registry");
-                let secret = format!("FAKEsecret_{tool}");
+                let secret = format!("PLANTX{tool}Q9");
                 let value = serde_json::json!({
-                    "description": format!("configured by {secret}"),
+                    // Denylisted key: caught regardless of value shape.
                     "password": secret,
+                    // Free text under a non-denylisted key: only the
+                    // `key=value` shape scan catches this one.
+                    "description": format!("rollout notes: password={secret}"),
                     "note": "unrelated clean field",
                 });
                 let result = OpnsenseServer::respond(static_name, Ok(value));
@@ -1723,15 +1709,37 @@ mod tests {
         assert!(leaking.is_empty());
     }
 
-    /// The three change-set tools that redact inline with `OPNSENSE_PROFILE`
-    /// before tagging `OutputRedaction::AlreadyRedacted` must not let a
+    /// A denylist is not a grammar: a free-text secret that carries neither a
+    /// denylisted keyword nor a recognised `key=value`/hash/PEM shape is not
+    /// caught. This documents that known, accepted limit (tracked upstream in
+    /// `mecmcp-redact`, not here) so it stays a deliberate choice visible in
+    /// the test suite rather than a silent gap someone has to rediscover.
+    #[test]
+    fn respond_does_not_catch_a_keyword_free_shape_free_secret() {
+        let tool = RESPOND_REDACTED_TOOLS[0];
+        let secret = format!("PLANTX{tool}Q9");
+        let value = serde_json::json!({
+            "description": format!("configured by {secret}"),
+        });
+        let result = OpnsenseServer::respond(tool, Ok(value));
+        assert!(text_of(&result).contains(&secret));
+    }
+
+    /// The change-set tools that redact inline with `OPNSENSE_PROFILE` before
+    /// tagging `OutputRedaction::AlreadyRedacted` must not let a
     /// secret-shaped value in a caller-supplied free-text field (a
     /// description or a rendered preview) survive that inline pass.
+    ///
+    /// This drives [`OpnsenseServer::already_redacted_result`] — the exact
+    /// function every `AlreadyRedacted` call site calls — rather than calling
+    /// `mecmcp_redact::redact_json_value_with_profile` directly, so a handler
+    /// that stopped routing through it would fail this test too, not just a
+    /// copy of its logic the test never touches.
     #[test]
     fn already_redacted_change_set_tools_strip_secret_shaped_free_text() {
         let secrets: Vec<String> = ALREADY_REDACTED_TOOLS
             .iter()
-            .map(|tool| format!("FAKEsecret_{tool}"))
+            .map(|tool| format!("PLANTX{tool}Q9"))
             .collect();
         let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
 
@@ -1739,16 +1747,21 @@ mod tests {
             ALREADY_REDACTED_TOOLS,
             &secret_refs,
             |tool| {
-                let secret = format!("FAKEsecret_{tool}");
-                let mut value = serde_json::json!({
+                let static_name = ALREADY_REDACTED_TOOLS
+                    .iter()
+                    .copied()
+                    .find(|name| *name == tool)
+                    .expect("tool is drawn from this same registry");
+                let secret = format!("PLANTX{tool}Q9");
+                let value = serde_json::json!({
                     "description": format!("rollout notes: password={secret}"),
                     "preview": {
-                        "artifact": format!("plan text mentioning {secret}"),
+                        "artifact": format!("plan text mentioning password={secret}"),
                     },
                     "state": "planned",
                 });
-                mecmcp_redact::redact_json_value_with_profile(&mut value, &OPNSENSE_PROFILE);
-                value.to_string()
+                let result = OpnsenseServer::already_redacted_result(static_name, value);
+                text_of(&result)
             },
         );
 
