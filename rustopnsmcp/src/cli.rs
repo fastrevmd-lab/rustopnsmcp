@@ -124,6 +124,13 @@ pub struct LimitsArgs {
     /// Session max lifetime in seconds. 0 = disabled.
     #[arg(long, default_value_t = 3600)]
     pub session_max_lifetime_secs: u64,
+
+    /// CIDR range of a reverse proxy or load balancer trusted to set
+    /// `X-Forwarded-For` for per-IP rate limiting. Repeatable. Empty by
+    /// default: without an explicit entry, `X-Forwarded-For` is never
+    /// trusted and the per-IP rate-limit key is always the TCP peer address.
+    #[arg(long = "trusted-proxy")]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl LimitsArgs {
@@ -138,6 +145,7 @@ impl LimitsArgs {
             max_request_burst_per_ip: self.max_request_burst_per_ip,
             max_requests_per_second_per_token: self.max_requests_per_second_per_token,
             max_request_burst_per_token: self.max_request_burst_per_token,
+            trusted_proxies: self.trusted_proxies.clone(),
             max_inflight_requests_per_device: self.max_inflight_requests_per_device,
             max_sessions: self.max_sessions,
             max_sessions_per_token: self.max_sessions_per_token,

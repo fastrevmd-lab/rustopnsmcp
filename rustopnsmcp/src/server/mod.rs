@@ -6,8 +6,8 @@ use mecmcp_changeset::{
     change_set_digest, preview_digest,
 };
 use mecmcp_server::{
-    ResultFormat, ResultLimits, authorize_call, caller_from_extensions, filter_tools_for_scope,
-    tool_error, tool_result,
+    OutputRedaction, ResultFormat, ResultLimits, authorize_call, caller_from_extensions,
+    filter_tools_for_scope, tool_error, tool_result,
 };
 use rmcp::{
     RoleServer, ServerHandler,
@@ -38,6 +38,19 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
     max_text_bytes: 512 * 1024,
     max_json_bytes: 512 * 1024,
 };
+
+/// This server's extensions to `mecmcp-redact`'s generic denylist-and-shape
+/// scan.
+///
+/// Empty today: none of OPNsense's nine read-tool resources or two
+/// mutable-resource kinds (aliases, filter rules) has a field name that both
+/// collides with the generic denylist by substring and is not a secret, and
+/// none embeds a vendor-rendered body the generic scan cannot see into. A
+/// `const` is declared anyway, matching every other vendor server in this
+/// family, so a future OPNsense resource that does need an exemption (a
+/// paging cursor, a BGP community on a routing-protocol integration) is a
+/// one-line change here rather than a re-plumb of every call site below.
+const OPNSENSE_PROFILE: mecmcp_redact::Profile = mecmcp_redact::Profile::new(&[], &[]);
 
 /// How many unstaged change sets may be held at once.
 ///
@@ -297,7 +310,7 @@ impl OpnsenseServer {
         // this is the one place a secret-shaped value in it is scrubbed
         // before either happens, mirroring what `Self::respond` already does
         // for every read tool.
-        mecmcp_redact::redact_json_value(&mut rendered);
+        mecmcp_redact::redact_json_value_with_profile(&mut rendered, &OPNSENSE_PROFILE);
 
         serde_json::to_string_pretty(&rendered)
             .map_err(|error| Box::new(tool_error(format!("failed to render the preview: {error}"))))
@@ -525,7 +538,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::system_status(&client).await)
+        Self::respond("opnsense_system_status", read::system_status(&client).await)
     }
 
     #[tool(
@@ -550,7 +563,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::firmware_status(&client).await)
+        Self::respond("opnsense_firmware_status", read::firmware_status(&client).await)
     }
 
     #[tool(
@@ -575,7 +588,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_interfaces(&client).await)
+        Self::respond("opnsense_list_interfaces", read::list_interfaces(&client).await)
     }
 
     #[tool(
@@ -600,7 +613,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_gateways(&client).await)
+        Self::respond("opnsense_list_gateways", read::list_gateways(&client).await)
     }
 
     #[tool(
@@ -628,7 +641,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_firewall_rules(&client, &args).await)
+        Self::respond("opnsense_list_firewall_rules", read::list_firewall_rules(&client, &args).await)
     }
 
     #[tool(
@@ -653,7 +666,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_aliases(&client, &args).await)
+        Self::respond("opnsense_list_aliases", read::list_aliases(&client, &args).await)
     }
 
     #[tool(
@@ -679,7 +692,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_nat_rules(&client, &args).await)
+        Self::respond("opnsense_list_nat_rules", read::list_nat_rules(&client, &args).await)
     }
 
     #[tool(
@@ -704,7 +717,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_routes(&client, &args).await)
+        Self::respond("opnsense_list_routes", read::list_routes(&client, &args).await)
     }
 
     #[tool(
@@ -730,7 +743,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_dhcp_leases(&client, &args).await)
+        Self::respond("opnsense_list_dhcp_leases", read::list_dhcp_leases(&client, &args).await)
     }
 
     #[tool(
@@ -805,6 +818,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -978,6 +992,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -1020,12 +1035,16 @@ impl OpnsenseServer {
             "computed": diff.computed,
             "changes": diff.changes,
         });
-        mecmcp_redact::redact_json_value(&mut result);
+        mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
 
         tool_result(
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::AlreadyRedacted {
+                tool: "opnsense_diff_change_set",
+                redacted_by: "OPNSENSE_PROFILE",
+            },
         )
     }
 
@@ -1081,6 +1100,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -1197,12 +1217,16 @@ impl OpnsenseServer {
         // it, but redacting again here is what keeps this call site correct
         // on its own rather than relying on staging-time behavior a future
         // change could quietly break.
-        mecmcp_redact::redact_json_value(&mut result);
+        mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
 
         tool_result(
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::AlreadyRedacted {
+                tool: "opnsense_approve_change_set",
+                redacted_by: "OPNSENSE_PROFILE",
+            },
         )
     }
 
@@ -1375,6 +1399,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -1408,11 +1433,15 @@ impl OpnsenseServer {
                 "note": "nothing is staged yet; this draft is held in memory and is \
                          lost on restart",
             });
-            mecmcp_redact::redact_json_value(&mut result);
+            mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
             return tool_result(
                 Ok::<_, String>(result),
                 ResultFormat::PrettyJson,
                 RESULT_LIMITS,
+                OutputRedaction::AlreadyRedacted {
+                    tool: "opnsense_get_change_set",
+                    redacted_by: "OPNSENSE_PROFILE",
+                },
             );
         }
 
@@ -1455,12 +1484,16 @@ impl OpnsenseServer {
             "expected_preimage_fingerprint": record.expected_candidate_fingerprint,
             "preview": record.preview.as_ref().map(|preview| preview.artifact.clone()),
         });
-        mecmcp_redact::redact_json_value(&mut result);
+        mecmcp_redact::redact_json_value_with_profile(&mut result, &OPNSENSE_PROFILE);
 
         tool_result(
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::AlreadyRedacted {
+                tool: "opnsense_get_change_set",
+                redacted_by: "OPNSENSE_PROFILE",
+            },
         )
     }
 }
@@ -1473,14 +1506,18 @@ impl OpnsenseServer {
     /// carries whatever it carries, and this is the one place a VPN PSK or an
     /// embedded credential in a description field is scrubbed before it
     /// reaches the caller.
-    fn respond(result: Result<serde_json::Value, OpnsenseError>) -> CallToolResult {
+    fn respond(tool: &'static str, result: Result<serde_json::Value, OpnsenseError>) -> CallToolResult {
         match result {
             Ok(mut json) => {
-                mecmcp_redact::redact_json_value(&mut json);
+                mecmcp_redact::redact_json_value_with_profile(&mut json, &OPNSENSE_PROFILE);
                 tool_result(
                     Ok::<_, String>(json),
                     ResultFormat::PrettyJson,
                     RESULT_LIMITS,
+                    OutputRedaction::AlreadyRedacted {
+                        tool,
+                        redacted_by: "OPNSENSE_PROFILE",
+                    },
                 )
             }
             Err(error) => tool_error(error),

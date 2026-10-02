@@ -67,6 +67,7 @@ fn init_audit(args: &mecmcp_runtime::cli::Cli) -> Result<Option<Arc<AuditFileSin
         audit_log_file: args.audit_log_file.clone(),
         redaction,
         journald: args.audit_journald,
+        otel: None,
     };
 
     match mecmcp_audit::init_tracing(&audit_config) {

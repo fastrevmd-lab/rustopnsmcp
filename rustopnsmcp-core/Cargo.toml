@@ -12,6 +12,7 @@ authors.workspace = true
 mecmcp-changeset.workspace = true
 mecmcp-http.workspace      = true
 mecmcp-inventory.workspace = true
+mecmcp-openapi.workspace   = true
 mecmcp-redact.workspace    = true
 mecmcp-secret.workspace    = true
 mecmcp-server.workspace    = true

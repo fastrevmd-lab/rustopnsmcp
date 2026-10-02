@@ -15,6 +15,7 @@ use crate::endpoints;
 use crate::error::OpnsenseError;
 use crate::inventory::Device;
 use mecmcp_http::{HttpClient, HttpClientConfig, HttpRequest, Method};
+use mecmcp_openapi::expand_path;
 use mecmcp_secret::OutboundSecret;
 use std::time::Duration;
 
@@ -86,8 +87,9 @@ impl OpnsenseClient {
     /// [`OpnsenseError::Http`] for network or protocol errors, and
     /// [`OpnsenseError::Malformed`] for a response that is not valid JSON.
     pub async fn get(&self, path: &str) -> Result<serde_json::Value, OpnsenseError> {
-        let url = format!("{}{path}", self.endpoint.trim_end_matches('/'));
-        let request = HttpRequest::new(Method::Get, &url)?
+        let expanded = expand_path(path, &[])
+            .map_err(|error| OpnsenseError::Malformed(format!("bad API path {path}: {error}")))?;
+        let request = HttpRequest::with_base_and_path(Method::Get, &self.endpoint, &expanded)?
             .header("Accept", "application/json")?
             .secret_header("Authorization", &self.basic_auth)?;
 
@@ -114,13 +116,14 @@ impl OpnsenseClient {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, OpnsenseError> {
-        let url = format!("{}{path}", self.endpoint.trim_end_matches('/'));
+        let expanded = expand_path(path, &[])
+            .map_err(|error| OpnsenseError::Malformed(format!("bad API path {path}: {error}")))?;
 
         let body_bytes = serde_json::to_vec(body).map_err(|error| {
             OpnsenseError::Malformed(format!("failed to serialize body: {error}"))
         })?;
 
-        let request = HttpRequest::new(Method::Post, &url)?
+        let request = HttpRequest::with_base_and_path(Method::Post, &self.endpoint, &expanded)?
             .header("Accept", "application/json")?
             .header("Content-Type", "application/json")?
             .secret_header("Authorization", &self.basic_auth)?
