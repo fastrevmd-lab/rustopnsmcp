@@ -1717,14 +1717,10 @@ mod tests {
         // `leaking` is a list of tool names (from the registry), never a
         // secret value, but CodeQL's taint tracking still treats it as
         // tainted because `secret` flowed into the exercised closure
-        // upstream. Assert on a derived count rather than formatting
-        // `leaking` itself, which keeps the tainted value out of the
-        // panic message entirely.
-        let leaking_count = leaking.len();
-        assert!(
-            leaking.is_empty(),
-            "{leaking_count} tool(s) leaking a secret"
-        );
+        // upstream. A bare `assert!` (no format-args message) keeps the
+        // tainted value out of any panic/log sink entirely, rather than
+        // just out of the message text.
+        assert!(leaking.is_empty());
     }
 
     /// The three change-set tools that redact inline with `OPNSENSE_PROFILE`
@@ -1757,12 +1753,8 @@ mod tests {
         );
 
         // See the matching note in `respond_redacts_every_known_opnsense_secret_shape`:
-        // assert on a derived count, not the tainted `leaking` value itself.
-        let leaking_count = leaking.len();
-        assert!(
-            leaking.is_empty(),
-            "{leaking_count} tool(s) leaking a secret"
-        );
+        // a bare `assert!` avoids any format-args sink for the tainted value.
+        assert!(leaking.is_empty());
     }
 
     /// Phase 2a's seven change-set tools are the only mutating surface;
