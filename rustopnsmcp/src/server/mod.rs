@@ -1603,6 +1603,152 @@ mod tests {
         );
     }
 
+    /// The only content a result carries, so a test can assert on it.
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect()
+    }
+
+    /// The nine read tools, all redacted through the shared [`OpnsenseServer::respond`]
+    /// path with [`OPNSENSE_PROFILE`].
+    const RESPOND_REDACTED_TOOLS: &[&str] = &[
+        "opnsense_system_status",
+        "opnsense_firmware_status",
+        "opnsense_list_interfaces",
+        "opnsense_list_gateways",
+        "opnsense_list_firewall_rules",
+        "opnsense_list_aliases",
+        "opnsense_list_nat_rules",
+        "opnsense_list_routes",
+        "opnsense_list_dhcp_leases",
+    ];
+
+    /// The three read-shaped change-set tools that redact their own result
+    /// with [`OPNSENSE_PROFILE`] before `tool_result`, tagging
+    /// `OutputRedaction::AlreadyRedacted` because the unconditional generic
+    /// pass `OutputRedaction::Apply` runs would otherwise be a silent
+    /// re-redaction of already-clean data.
+    const ALREADY_REDACTED_TOOLS: &[&str] = &[
+        "opnsense_diff_change_set",
+        "opnsense_approve_change_set",
+        "opnsense_get_change_set",
+    ];
+
+    /// The four change-set lifecycle tools that carry no caller-controlled
+    /// free text of their own (ids, digests, counts) and rely on
+    /// `tool_result`'s unconditional `OutputRedaction::Apply` pass.
+    const APPLY_REDACTED_TOOLS: &[&str] = &[
+        "opnsense_create_change_set",
+        "opnsense_stage_change",
+        "opnsense_validate_change_set",
+        "opnsense_apply_change_set",
+    ];
+
+    /// Every registered tool must be accounted for by exactly one of the
+    /// three redaction strategies above. A tool added to the router without
+    /// being added to one of these lists — and so without a considered
+    /// redaction choice — fails this test rather than silently returning
+    /// unredacted device data.
+    #[test]
+    fn every_registered_tool_has_a_named_redaction_strategy() {
+        use rustopnsmcp_core::tools::TOOL_NAMES;
+        use std::collections::BTreeSet;
+
+        let registered: BTreeSet<&str> = TOOL_NAMES.iter().copied().collect();
+        let accounted: Vec<&str> = RESPOND_REDACTED_TOOLS
+            .iter()
+            .chain(ALREADY_REDACTED_TOOLS)
+            .chain(APPLY_REDACTED_TOOLS)
+            .copied()
+            .collect();
+        let accounted_set: BTreeSet<&str> = accounted.iter().copied().collect();
+
+        assert_eq!(
+            accounted.len(),
+            accounted_set.len(),
+            "a tool name appears in more than one redaction-strategy list"
+        );
+        assert_eq!(
+            accounted_set, registered,
+            "every tool in TOOL_NAMES must appear in exactly one redaction-strategy list above"
+        );
+    }
+
+    /// A response containing a distinct, synthetic secret for each of the
+    /// nine read tools comes back redacted, and no tool's rendered output
+    /// contains any planted secret — not just the one its own fixture
+    /// plants, so a tool that leaked the *wrong* secret would still be
+    /// caught (mirrors `mecmcp_redact::testing::tools_leaking_secrets`'s own
+    /// coverage rationale).
+    #[test]
+    fn respond_redacts_every_known_opnsense_secret_shape() {
+        let secrets: Vec<String> = RESPOND_REDACTED_TOOLS
+            .iter()
+            .map(|tool| format!("FAKEsecret_{tool}"))
+            .collect();
+        let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+
+        let leaking = mecmcp_redact::testing::tools_leaking_secrets(
+            RESPOND_REDACTED_TOOLS,
+            &secret_refs,
+            |tool| {
+                // `respond` takes `tool: &'static str`; look the caller's
+                // borrowed name back up in the `'static` registry instead of
+                // leaking a fresh allocation per call.
+                let static_name = RESPOND_REDACTED_TOOLS
+                    .iter()
+                    .copied()
+                    .find(|name| *name == tool)
+                    .expect("tool is drawn from this same registry");
+                let secret = format!("FAKEsecret_{tool}");
+                let value = serde_json::json!({
+                    "description": format!("configured by {secret}"),
+                    "password": secret,
+                    "note": "unrelated clean field",
+                });
+                let result = OpnsenseServer::respond(static_name, Ok(value));
+                text_of(&result)
+            },
+        );
+
+        assert!(leaking.is_empty(), "tools leaking a secret: {leaking:?}");
+    }
+
+    /// The three change-set tools that redact inline with `OPNSENSE_PROFILE`
+    /// before tagging `OutputRedaction::AlreadyRedacted` must not let a
+    /// secret-shaped value in a caller-supplied free-text field (a
+    /// description or a rendered preview) survive that inline pass.
+    #[test]
+    fn already_redacted_change_set_tools_strip_secret_shaped_free_text() {
+        let secrets: Vec<String> = ALREADY_REDACTED_TOOLS
+            .iter()
+            .map(|tool| format!("FAKEsecret_{tool}"))
+            .collect();
+        let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+
+        let leaking = mecmcp_redact::testing::tools_leaking_secrets(
+            ALREADY_REDACTED_TOOLS,
+            &secret_refs,
+            |tool| {
+                let secret = format!("FAKEsecret_{tool}");
+                let mut value = serde_json::json!({
+                    "description": format!("rollout notes: password={secret}"),
+                    "preview": {
+                        "artifact": format!("plan text mentioning {secret}"),
+                    },
+                    "state": "planned",
+                });
+                mecmcp_redact::redact_json_value_with_profile(&mut value, &OPNSENSE_PROFILE);
+                value.to_string()
+            },
+        );
+
+        assert!(leaking.is_empty(), "tools leaking a secret: {leaking:?}");
+    }
+
     /// Phase 2a's seven change-set tools are the only mutating surface;
     /// this is meant to stay visible rather than silently assumed.
     #[test]
