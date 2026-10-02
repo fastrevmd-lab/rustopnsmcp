@@ -449,7 +449,7 @@ async fn a_cert_the_configured_private_ca_did_not_issue_is_refused() {
     let result = read::system_status(&client).await;
     assert!(
         result.is_err(),
-        "a cert not signed by the configured private CA must be refused, got {result:?}"
+        "a cert not signed by the configured private CA must be refused, but the request succeeded"
     );
 }
 
@@ -520,6 +520,7 @@ async fn a_redirect_response_is_an_upstream_error() {
         Err(rustopnsmcp_core::error::OpnsenseError::Upstream { status, .. }) => {
             assert_eq!(status, 302);
         }
-        other => panic!("expected Upstream {{ status: 302, .. }}, got {other:?}"),
+        Ok(_) => panic!("expected Upstream {{ status: 302, .. }}, got Ok"),
+        Err(_) => panic!("expected Upstream {{ status: 302, .. }}, got a different error variant"),
     }
 }

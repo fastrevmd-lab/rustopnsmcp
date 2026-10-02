@@ -1715,11 +1715,16 @@ mod tests {
         );
 
         // `leaking` is a list of tool names (from the registry), never a
-        // secret value — `tools_leaking_secrets` only returns `*tool`, so
-        // this assert message cannot contain `FAKEsecret_*` text. CodeQL's
-        // taint tracking still flags the format string because `secret`
-        // flows into the exercised closure upstream.
-        assert!(leaking.is_empty(), "tools leaking a secret: {leaking:?}"); // lgtm[rust/cleartext-logging]
+        // secret value, but CodeQL's taint tracking still treats it as
+        // tainted because `secret` flowed into the exercised closure
+        // upstream. Assert on a derived count rather than formatting
+        // `leaking` itself, which keeps the tainted value out of the
+        // panic message entirely.
+        let leaking_count = leaking.len();
+        assert!(
+            leaking.is_empty(),
+            "{leaking_count} tool(s) leaking a secret"
+        );
     }
 
     /// The three change-set tools that redact inline with `OPNSENSE_PROFILE`
@@ -1752,8 +1757,12 @@ mod tests {
         );
 
         // See the matching note in `respond_redacts_every_known_opnsense_secret_shape`:
-        // `leaking` holds tool names only, never a secret value.
-        assert!(leaking.is_empty(), "tools leaking a secret: {leaking:?}"); // lgtm[rust/cleartext-logging]
+        // assert on a derived count, not the tainted `leaking` value itself.
+        let leaking_count = leaking.len();
+        assert!(
+            leaking.is_empty(),
+            "{leaking_count} tool(s) leaking a secret"
+        );
     }
 
     /// Phase 2a's seven change-set tools are the only mutating surface;
