@@ -128,6 +128,9 @@ fn http_error_class(error: &mecmcp_http::HttpError) -> String {
         }
         HttpError::BodyRead { .. } => "failed to read response body".to_owned(),
         HttpError::RequestFailed { .. } => "request failed".to_owned(),
+        // This client never calls `send_get_with_backoff`, the only path
+        // that returns this variant, but the match must still be exhaustive.
+        HttpError::RetryRequiresGet => "retry requires a GET request".to_owned(),
     }
 }
 

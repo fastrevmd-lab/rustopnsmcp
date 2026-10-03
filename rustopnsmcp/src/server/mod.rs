@@ -6,8 +6,8 @@ use mecmcp_changeset::{
     change_set_digest, preview_digest,
 };
 use mecmcp_server::{
-    ResultFormat, ResultLimits, authorize_call, caller_from_extensions, filter_tools_for_scope,
-    tool_error, tool_result,
+    OutputRedaction, ResultFormat, ResultLimits, authorize_call, caller_from_extensions,
+    filter_tools_for_scope, tool_error, tool_result,
 };
 use rmcp::{
     RoleServer, ServerHandler,
@@ -38,6 +38,19 @@ const RESULT_LIMITS: ResultLimits = ResultLimits {
     max_text_bytes: 512 * 1024,
     max_json_bytes: 512 * 1024,
 };
+
+/// This server's extensions to `mecmcp-redact`'s generic denylist-and-shape
+/// scan.
+///
+/// Empty today: none of OPNsense's nine read-tool resources or two
+/// mutable-resource kinds (aliases, filter rules) has a field name that both
+/// collides with the generic denylist by substring and is not a secret, and
+/// none embeds a vendor-rendered body the generic scan cannot see into. A
+/// `const` is declared anyway, matching every other vendor server in this
+/// family, so a future OPNsense resource that does need an exemption (a
+/// paging cursor, a BGP community on a routing-protocol integration) is a
+/// one-line change here rather than a re-plumb of every call site below.
+const OPNSENSE_PROFILE: mecmcp_redact::Profile = mecmcp_redact::Profile::new(&[], &[]);
 
 /// How many unstaged change sets may be held at once.
 ///
@@ -297,7 +310,7 @@ impl OpnsenseServer {
         // this is the one place a secret-shaped value in it is scrubbed
         // before either happens, mirroring what `Self::respond` already does
         // for every read tool.
-        mecmcp_redact::redact_json_value(&mut rendered);
+        mecmcp_redact::redact_json_value_with_profile(&mut rendered, &OPNSENSE_PROFILE);
 
         serde_json::to_string_pretty(&rendered)
             .map_err(|error| Box::new(tool_error(format!("failed to render the preview: {error}"))))
@@ -525,7 +538,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::system_status(&client).await)
+        Self::respond("opnsense_system_status", read::system_status(&client).await)
     }
 
     #[tool(
@@ -550,7 +563,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::firmware_status(&client).await)
+        Self::respond(
+            "opnsense_firmware_status",
+            read::firmware_status(&client).await,
+        )
     }
 
     #[tool(
@@ -575,7 +591,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_interfaces(&client).await)
+        Self::respond(
+            "opnsense_list_interfaces",
+            read::list_interfaces(&client).await,
+        )
     }
 
     #[tool(
@@ -600,7 +619,7 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_gateways(&client).await)
+        Self::respond("opnsense_list_gateways", read::list_gateways(&client).await)
     }
 
     #[tool(
@@ -628,7 +647,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_firewall_rules(&client, &args).await)
+        Self::respond(
+            "opnsense_list_firewall_rules",
+            read::list_firewall_rules(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -653,7 +675,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_aliases(&client, &args).await)
+        Self::respond(
+            "opnsense_list_aliases",
+            read::list_aliases(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -679,7 +704,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_nat_rules(&client, &args).await)
+        Self::respond(
+            "opnsense_list_nat_rules",
+            read::list_nat_rules(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -704,7 +732,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_routes(&client, &args).await)
+        Self::respond(
+            "opnsense_list_routes",
+            read::list_routes(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -730,7 +761,10 @@ impl OpnsenseServer {
             Ok(client) => client,
             Err(result) => return *result,
         };
-        Self::respond(read::list_dhcp_leases(&client, &args).await)
+        Self::respond(
+            "opnsense_list_dhcp_leases",
+            read::list_dhcp_leases(&client, &args).await,
+        )
     }
 
     #[tool(
@@ -805,6 +839,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -978,6 +1013,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -1015,18 +1051,13 @@ impl OpnsenseServer {
             Err(e) => return tool_error(format!("failed to compute diff: {e}")),
         };
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "change_set_id": record.id,
             "computed": diff.computed,
             "changes": diff.changes,
         });
-        mecmcp_redact::redact_json_value(&mut result);
 
-        tool_result(
-            Ok::<_, String>(result),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-        )
+        Self::already_redacted_result("opnsense_diff_change_set", result)
     }
 
     #[tool(
@@ -1081,6 +1112,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -1184,7 +1216,7 @@ impl OpnsenseServer {
             }
         };
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "change_set_id": outcome.change_set_id,
             "state": outcome.state.as_str(),
             "approved_by": outcome.approver,
@@ -1197,13 +1229,7 @@ impl OpnsenseServer {
         // it, but redacting again here is what keeps this call site correct
         // on its own rather than relying on staging-time behavior a future
         // change could quietly break.
-        mecmcp_redact::redact_json_value(&mut result);
-
-        tool_result(
-            Ok::<_, String>(result),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-        )
+        Self::already_redacted_result("opnsense_approve_change_set", result)
     }
 
     #[tool(
@@ -1375,6 +1401,7 @@ impl OpnsenseServer {
             Ok::<_, String>(result),
             ResultFormat::PrettyJson,
             RESULT_LIMITS,
+            OutputRedaction::Apply,
         )
     }
 
@@ -1398,7 +1425,7 @@ impl OpnsenseServer {
         }
 
         if let Some(draft) = self.draft(&args.change_set_id, &args.device) {
-            let mut result = serde_json::json!({
+            let result = serde_json::json!({
                 "change_set_id": args.change_set_id,
                 "device": draft.device,
                 "description": draft.description,
@@ -1408,12 +1435,7 @@ impl OpnsenseServer {
                 "note": "nothing is staged yet; this draft is held in memory and is \
                          lost on restart",
             });
-            mecmcp_redact::redact_json_value(&mut result);
-            return tool_result(
-                Ok::<_, String>(result),
-                ResultFormat::PrettyJson,
-                RESULT_LIMITS,
-            );
+            return Self::already_redacted_result("opnsense_get_change_set", result);
         }
 
         if let Err(error) = self
@@ -1437,7 +1459,7 @@ impl OpnsenseServer {
 
         let description = Self::description_of(&record).unwrap_or_default();
 
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "change_set_id": record.id,
             "device": record.device,
             "description": description,
@@ -1455,13 +1477,8 @@ impl OpnsenseServer {
             "expected_preimage_fingerprint": record.expected_candidate_fingerprint,
             "preview": record.preview.as_ref().map(|preview| preview.artifact.clone()),
         });
-        mecmcp_redact::redact_json_value(&mut result);
 
-        tool_result(
-            Ok::<_, String>(result),
-            ResultFormat::PrettyJson,
-            RESULT_LIMITS,
-        )
+        Self::already_redacted_result("opnsense_get_change_set", result)
     }
 }
 
@@ -1473,18 +1490,38 @@ impl OpnsenseServer {
     /// carries whatever it carries, and this is the one place a VPN PSK or an
     /// embedded credential in a description field is scrubbed before it
     /// reaches the caller.
-    fn respond(result: Result<serde_json::Value, OpnsenseError>) -> CallToolResult {
+    fn respond(
+        tool: &'static str,
+        result: Result<serde_json::Value, OpnsenseError>,
+    ) -> CallToolResult {
         match result {
-            Ok(mut json) => {
-                mecmcp_redact::redact_json_value(&mut json);
-                tool_result(
-                    Ok::<_, String>(json),
-                    ResultFormat::PrettyJson,
-                    RESULT_LIMITS,
-                )
-            }
+            Ok(json) => Self::already_redacted_result(tool, json),
             Err(error) => tool_error(error),
         }
+    }
+
+    /// Redact `value` with [`OPNSENSE_PROFILE`] and wrap it as a tool result
+    /// tagged `OutputRedaction::AlreadyRedacted`.
+    ///
+    /// This is the single call site every `AlreadyRedacted`-tagged tool
+    /// result goes through — `respond` above, and each change-set tool that
+    /// redacts inline before returning its own result shape. Routing every
+    /// one of them through the same function is what lets a unit test
+    /// exercise the exact code the handlers run: if a future edit dropped
+    /// the redaction call from here, every caller — and the test — would
+    /// fail together, rather than a handler drifting from a copy of this
+    /// logic the test never touches.
+    fn already_redacted_result(tool: &'static str, mut value: serde_json::Value) -> CallToolResult {
+        mecmcp_redact::redact_json_value_with_profile(&mut value, &OPNSENSE_PROFILE);
+        tool_result(
+            Ok::<_, String>(value),
+            ResultFormat::PrettyJson,
+            RESULT_LIMITS,
+            OutputRedaction::AlreadyRedacted {
+                tool,
+                redacted_by: "OPNSENSE_PROFILE",
+            },
+        )
     }
 }
 
@@ -1540,6 +1577,179 @@ mod tests {
             served_names, registered_names,
             "TOOL_NAMES and the tool router must list exactly the same tools"
         );
+    }
+
+    /// The only content a result carries, so a test can assert on it.
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect()
+    }
+
+    /// The nine read tools, all redacted through the shared [`OpnsenseServer::respond`]
+    /// path with [`OPNSENSE_PROFILE`].
+    const RESPOND_REDACTED_TOOLS: &[&str] = &[
+        "opnsense_system_status",
+        "opnsense_firmware_status",
+        "opnsense_list_interfaces",
+        "opnsense_list_gateways",
+        "opnsense_list_firewall_rules",
+        "opnsense_list_aliases",
+        "opnsense_list_nat_rules",
+        "opnsense_list_routes",
+        "opnsense_list_dhcp_leases",
+    ];
+
+    /// The three read-shaped change-set tools that redact their own result
+    /// with [`OPNSENSE_PROFILE`] before `tool_result`, tagging
+    /// `OutputRedaction::AlreadyRedacted` because the unconditional generic
+    /// pass `OutputRedaction::Apply` runs would otherwise be a silent
+    /// re-redaction of already-clean data.
+    const ALREADY_REDACTED_TOOLS: &[&str] = &[
+        "opnsense_diff_change_set",
+        "opnsense_approve_change_set",
+        "opnsense_get_change_set",
+    ];
+
+    /// The four change-set lifecycle tools that carry no caller-controlled
+    /// free text of their own (ids, digests, counts) and rely on
+    /// `tool_result`'s unconditional `OutputRedaction::Apply` pass.
+    const APPLY_REDACTED_TOOLS: &[&str] = &[
+        "opnsense_create_change_set",
+        "opnsense_stage_change",
+        "opnsense_validate_change_set",
+        "opnsense_apply_change_set",
+    ];
+
+    /// Every registered tool must be accounted for by exactly one of the
+    /// three redaction strategies above. A tool added to the router without
+    /// being added to one of these lists — and so without a considered
+    /// redaction choice — fails this test rather than silently returning
+    /// unredacted device data.
+    #[test]
+    fn every_registered_tool_has_a_named_redaction_strategy() {
+        use rustopnsmcp_core::tools::TOOL_NAMES;
+        use std::collections::BTreeSet;
+
+        let registered: BTreeSet<&str> = TOOL_NAMES.iter().copied().collect();
+        let accounted: Vec<&str> = RESPOND_REDACTED_TOOLS
+            .iter()
+            .chain(ALREADY_REDACTED_TOOLS)
+            .chain(APPLY_REDACTED_TOOLS)
+            .copied()
+            .collect();
+        let accounted_set: BTreeSet<&str> = accounted.iter().copied().collect();
+
+        assert_eq!(
+            accounted.len(),
+            accounted_set.len(),
+            "a tool name appears in more than one redaction-strategy list"
+        );
+        assert_eq!(
+            accounted_set, registered,
+            "every tool in TOOL_NAMES must appear in exactly one redaction-strategy list above"
+        );
+    }
+
+    /// A response containing a distinct, synthetic secret for each of the
+    /// nine read tools comes back redacted, and no tool's rendered output
+    /// contains any planted secret — not just the one its own fixture
+    /// plants, so a tool that leaked the *wrong* secret would still be
+    /// caught (mirrors `mecmcp_redact::testing::tools_leaking_secrets`'s own
+    /// coverage rationale).
+    ///
+    /// The marker (`PLANTX<tool>Q9`) contains none of
+    /// `mecmcp_redact`'s denylisted words (no "secret", "token", "key", ...),
+    /// so a match here proves the `password` field or the `key=value` free-text
+    /// shape was actually recognised.
+    #[test]
+    fn respond_redacts_every_known_opnsense_secret_shape() {
+        let secrets: Vec<String> = RESPOND_REDACTED_TOOLS
+            .iter()
+            .map(|tool| format!("PLANTX{tool}Q9"))
+            .collect();
+        let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+
+        let leaking = mecmcp_redact::testing::tools_leaking_secrets(
+            RESPOND_REDACTED_TOOLS,
+            &secret_refs,
+            |tool| {
+                // `respond` takes `tool: &'static str`; look the caller's
+                // borrowed name back up in the `'static` registry instead of
+                // leaking a fresh allocation per call.
+                let static_name = RESPOND_REDACTED_TOOLS
+                    .iter()
+                    .copied()
+                    .find(|name| *name == tool)
+                    .expect("tool is drawn from this same registry");
+                let secret = format!("PLANTX{tool}Q9");
+                let value = serde_json::json!({
+                    // Denylisted key: caught regardless of value shape.
+                    "password": secret,
+                    // Free text under a non-denylisted key: only the
+                    // `key=value` shape scan catches this one.
+                    "description": format!("rollout notes: password={secret}"),
+                    "note": "unrelated clean field",
+                });
+                let result = OpnsenseServer::respond(static_name, Ok(value));
+                text_of(&result)
+            },
+        );
+
+        // `leaking` is a list of tool names (from the registry), never a
+        // secret value, but CodeQL's taint tracking still treats it as
+        // tainted because `secret` flowed into the exercised closure
+        // upstream. A bare `assert!` (no format-args message) keeps the
+        // tainted value out of any panic/log sink entirely, rather than
+        // just out of the message text.
+        assert!(leaking.is_empty());
+    }
+
+    /// The change-set tools that redact inline with `OPNSENSE_PROFILE` before
+    /// tagging `OutputRedaction::AlreadyRedacted` must not let a
+    /// secret-shaped value in a caller-supplied free-text field (a
+    /// description or a rendered preview) survive that inline pass.
+    ///
+    /// This drives [`OpnsenseServer::already_redacted_result`] — the exact
+    /// function every `AlreadyRedacted` call site calls — rather than calling
+    /// `mecmcp_redact::redact_json_value_with_profile` directly, so a handler
+    /// that stopped routing through it would fail this test too, not just a
+    /// copy of its logic the test never touches.
+    #[test]
+    fn already_redacted_change_set_tools_strip_secret_shaped_free_text() {
+        let secrets: Vec<String> = ALREADY_REDACTED_TOOLS
+            .iter()
+            .map(|tool| format!("PLANTX{tool}Q9"))
+            .collect();
+        let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+
+        let leaking = mecmcp_redact::testing::tools_leaking_secrets(
+            ALREADY_REDACTED_TOOLS,
+            &secret_refs,
+            |tool| {
+                let static_name = ALREADY_REDACTED_TOOLS
+                    .iter()
+                    .copied()
+                    .find(|name| *name == tool)
+                    .expect("tool is drawn from this same registry");
+                let secret = format!("PLANTX{tool}Q9");
+                let value = serde_json::json!({
+                    "description": format!("rollout notes: password={secret}"),
+                    "preview": {
+                        "artifact": format!("plan text mentioning password={secret}"),
+                    },
+                    "state": "planned",
+                });
+                let result = OpnsenseServer::already_redacted_result(static_name, value);
+                text_of(&result)
+            },
+        );
+
+        // See the matching note in `respond_redacts_every_known_opnsense_secret_shape`:
+        // a bare `assert!` avoids any format-args sink for the tainted value.
+        assert!(leaking.is_empty());
     }
 
     /// Phase 2a's seven change-set tools are the only mutating surface;

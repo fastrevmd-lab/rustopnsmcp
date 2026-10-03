@@ -21,6 +21,7 @@ rmcp.workspace = true
 schemars.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -33,6 +34,7 @@ uuid.workspace = true
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
+mecmcp-redact = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
