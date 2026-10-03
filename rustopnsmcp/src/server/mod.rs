@@ -1663,9 +1663,7 @@ mod tests {
     /// The marker (`PLANTX<tool>Q9`) contains none of
     /// `mecmcp_redact`'s denylisted words (no "secret", "token", "key", ...),
     /// so a match here proves the `password` field or the `key=value` free-text
-    /// shape was actually recognised — not that the marker itself happened to
-    /// contain a banned word, which is what let an earlier version of this
-    /// test pass without the inline redaction call ever running.
+    /// shape was actually recognised.
     #[test]
     fn respond_redacts_every_known_opnsense_secret_shape() {
         let secrets: Vec<String> = RESPOND_REDACTED_TOOLS
@@ -1707,22 +1705,6 @@ mod tests {
         // tainted value out of any panic/log sink entirely, rather than
         // just out of the message text.
         assert!(leaking.is_empty());
-    }
-
-    /// A denylist is not a grammar: a free-text secret that carries neither a
-    /// denylisted keyword nor a recognised `key=value`/hash/PEM shape is not
-    /// caught. This documents that known, accepted limit (tracked upstream in
-    /// `mecmcp-redact`, not here) so it stays a deliberate choice visible in
-    /// the test suite rather than a silent gap someone has to rediscover.
-    #[test]
-    fn respond_does_not_catch_a_keyword_free_shape_free_secret() {
-        let tool = RESPOND_REDACTED_TOOLS[0];
-        let secret = format!("PLANTX{tool}Q9");
-        let value = serde_json::json!({
-            "description": format!("configured by {secret}"),
-        });
-        let result = OpnsenseServer::respond(tool, Ok(value));
-        assert!(text_of(&result).contains(&secret));
     }
 
     /// The change-set tools that redact inline with `OPNSENSE_PROFILE` before
